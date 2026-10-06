@@ -37,11 +37,15 @@ python -m src.sios.collector --keyword "bóbr"
 python -m src.sios.collector --keyword "Castor fiber" --max-pages 5
 python -m src.sios.collector --all-keywords
 python -m src.sios.collector --card-id 449913
+python -m src.sios.collector --keyword "bóbr" \
+  --since 2026-08-06 --until 2026-10-06 --max-pages 20
 ```
 
 Useful flags:
 
 - `--max-pages N` — hard cap on search pages
+- `--since YYYY-MM-DD` — inclusive bounded collection using SIOS `entered_at`
+- `--until YYYY-MM-DD` — inclusive end date; defaults to today with `--since`
 - `--delay 2.0` — seconds between requests
 - `--no-raw` — skip saving HTML snapshots
 - `--log-level DEBUG`
@@ -58,6 +62,21 @@ Errors: 0
 ```
 
 Repeated runs update `last_seen_at` and merge keyword matches. They do not insert duplicate `sios_id` rows.
+
+### Date-bounded collection
+
+The public result-list date is incomplete and corresponds to the document's
+received date. Bounded collection instead uses detail-page `Data wprowadzenia`
+(`entered_at`), which was present and newest-first across the validated
+300-card sample.
+
+Known cards use their stored `entered_at` and do not trigger another detail
+request. New cards are fetched as needed. The collector stops after a complete
+page is older than `--since`. It validates that `entered_at` remains
+non-increasing and stops with `ORDERING_UNSAFE` if the undocumented ordering
+assumption fails; it does not silently continue into a historical crawl.
+
+Keep an explicit `--max-pages` safety cap for live bounded runs.
 
 ## Data
 

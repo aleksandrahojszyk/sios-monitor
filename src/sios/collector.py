@@ -5,6 +5,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +13,7 @@ from .client import SiosClient, SiosHttpError
 from .config import CollectorSettings, flatten_keywords, load_keyword_groups, load_settings
 from .detail_parser import parse_detail_page
 from .logging_utils import configure_logging, log_extra
-from .models import PaginationDecision, SearchHit, pagination_decision
+from .models import CardRecord, PaginationDecision, SearchHit, pagination_decision
 from .search_parser import parse_search_page, parse_total_count
 from .storage import STATUS_CHANGED, STATUS_NEW, STATUS_UNCHANGED, Storage, UpsertResult
 
@@ -25,6 +26,8 @@ STOP_MAX_PAGES = "MAX_PAGES"
 STOP_HTTP_ERROR = "HTTP_ERROR"
 STOP_COMPLETED = "COMPLETED"
 STOP_PARTIAL_DETAIL_FAILURE = "PARTIAL_DETAIL_FAILURE"
+STOP_WINDOW_PASSED = "WINDOW_PASSED"
+STOP_ORDERING_UNSAFE = "ORDERING_UNSAFE"
 
 _SEARCH_STOP_REASONS = {
     "empty_page": STOP_EMPTY_PAGE,
@@ -32,6 +35,8 @@ _SEARCH_STOP_REASONS = {
     "no_new_ids": STOP_NO_NEW_IDS,
     "max_pages": STOP_MAX_PAGES,
     "http_error": STOP_HTTP_ERROR,
+    "window_passed": STOP_WINDOW_PASSED,
+    "ordering_unsafe": STOP_ORDERING_UNSAFE,
 }
 
 
@@ -56,9 +61,31 @@ def _count_outcome(result: KeywordRunResult, status: str) -> None:
         result.new_cards += 1
     elif status == STATUS_CHANGED:
         result.changed_cards += 1
+        result.existing_cards += 1
     elif status == STATUS_UNCHANGED:
         result.unchanged_cards += 1
-    result.existing_cards = result.changed_cards + result.unchanged_cards
+        result.existing_cards += 1
+
+
+def parse_source_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text = value.strip()
+    for format_string in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, format_string)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_cli_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "Expected date in YYYY-MM-DD format: {}".format(value)
+        )
 
 
 def keyword_slug(keyword: str) -> str:
@@ -87,6 +114,14 @@ class KeywordRunResult:
     stop_reason: Optional[str] = None
     reported_total: Optional[int] = None
     run_id: Optional[int] = None
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
+    cards_encountered: int = 0
+    cards_in_window: int = 0
+    cards_skipped_too_old: int = 0
+    cards_skipped_too_new: int = 0
+    known_cards_skipped: int = 0
+    detail_pages_fetched: int = 0
     status: str = "ok"
 
 
@@ -183,18 +218,22 @@ class Collector:
             error_count=result.errors,
             reported_total=result.reported_total,
             stop_reason=result.stop_reason,
+            cards_encountered=result.cards_encountered,
+            cards_in_window=result.cards_in_window,
+            cards_skipped_too_old=result.cards_skipped_too_old,
+            cards_skipped_too_new=result.cards_skipped_too_new,
+            known_cards_skipped=result.known_cards_skipped,
+            detail_pages_fetched=result.detail_pages_fetched,
             status=status,
             error=error,
         )
 
-    def fetch_card(
+    def fetch_card_record(
         self,
         sios_id: int,
-        keywords: Optional[list[str]] = None,
         search_hit: Optional[SearchHit] = None,
-        run_id: Optional[int] = None,
-    ) -> Optional[UpsertResult]:
-        """Fetch, parse, and store one card. Returns the observation outcome."""
+    ) -> Optional[CardRecord]:
+        """Fetch and parse one public card without storing it."""
         url = self.client.card_url(sios_id)
         try:
             html = self.client.fetch_card(sios_id)
@@ -230,6 +269,19 @@ class Collector:
             record.document_type = record.document_type or search_hit.document_type
             record.case_reference = record.case_reference or search_hit.case_reference
             record.location = record.location or search_hit.location
+        return record
+
+    def fetch_card(
+        self,
+        sios_id: int,
+        keywords: Optional[list[str]] = None,
+        search_hit: Optional[SearchHit] = None,
+        run_id: Optional[int] = None,
+    ) -> Optional[UpsertResult]:
+        """Fetch, parse, and store one card. Returns the observation outcome."""
+        record = self.fetch_card_record(sios_id, search_hit=search_hit)
+        if record is None:
+            return None
         record.matched_keywords = list(keywords or [])
         return self.storage.upsert_card(record, run_id=run_id)
 
@@ -280,6 +332,228 @@ class Collector:
         )
         return result
 
+    def collect_keyword_window(
+        self,
+        keyword: str,
+        *,
+        since: date,
+        until: date,
+        max_pages: Optional[int] = None,
+    ) -> KeywordRunResult:
+        """Collect cards whose SIOS entry timestamp falls in an inclusive window.
+
+        The public result-list date is the received date and is incomplete, so
+        traversal uses detail-page ``entered_at``. Known cards use their stored
+        value and avoid another detail request. The method fails closed if the
+        observed newest-first ordering is violated or the source date is absent.
+        """
+        if until < since:
+            raise ValueError("until must be on or after since")
+
+        run_id = self.storage.start_run(
+            keyword,
+            window_start=since.isoformat(),
+            window_end=until.isoformat(),
+        )
+        result = KeywordRunResult(
+            keyword=keyword,
+            run_id=run_id,
+            window_start=since.isoformat(),
+            window_end=until.isoformat(),
+        )
+        logger.info(
+            "run_start",
+            extra=log_extra(
+                run_id=run_id,
+                keyword=keyword,
+                window_start=result.window_start,
+                window_end=result.window_end,
+                date_basis="entered_at",
+            ),
+        )
+
+        limit = max_pages if max_pages is not None else self.settings.max_pages
+        seen_ids: set[int] = set()
+        previous_ids: Optional[set[int]] = None
+        previous_entered_at: Optional[datetime] = None
+        page = 1
+        error_message: Optional[str] = None
+
+        try:
+            while page <= limit:
+                try:
+                    html = self.client.search(keyword, page=page)
+                except SiosHttpError as exc:
+                    result.errors += 1
+                    result.status = "error"
+                    result.termination_reason = "http_error"
+                    error_message = str(exc)
+                    logger.exception(
+                        "search_page_failed",
+                        extra=log_extra(keyword=keyword, page=page),
+                    )
+                    break
+
+                if self.settings.save_raw_html:
+                    filename = f"search_{keyword_slug(keyword)}_page_{page}.html"
+                    write_raw(self.settings.raw_search_dir / filename, html)
+                if page == 1:
+                    result.reported_total = parse_total_count(html)
+
+                page_hits = parse_search_page(
+                    html, keyword=keyword, base_url=self.settings.base_url
+                )
+                page_ids = [hit.sios_id for hit in page_hits]
+                decision = pagination_decision(page_ids, previous_ids, seen_ids)
+                result.pages_processed += 1
+                if decision.stop:
+                    result.termination_reason = decision.reason
+                    break
+
+                page_all_too_old = True
+                ordering_unsafe = False
+                for hit in page_hits:
+                    if hit.sios_id not in decision.new_ids:
+                        continue
+                    result.cards_encountered += 1
+                    existing = self.storage.get_card(hit.sios_id)
+                    record: Optional[CardRecord] = None
+                    entered_at = None
+
+                    if existing is not None:
+                        entered_at = parse_source_datetime(
+                            existing["dates"].get("entered_at")
+                        )
+                        if entered_at is not None:
+                            result.known_cards_skipped += 1
+
+                    if entered_at is None:
+                        record = self.fetch_card_record(
+                            hit.sios_id, search_hit=hit
+                        )
+                        result.detail_pages_fetched += 1
+                        if record is not None:
+                            entered_at = parse_source_datetime(
+                                record.dates.get("entered_at")
+                            )
+
+                    if entered_at is None:
+                        result.errors += 1
+                        result.status = "error"
+                        result.termination_reason = "ordering_unsafe"
+                        error_message = (
+                            "Missing or invalid entered_at for card {}".format(
+                                hit.sios_id
+                            )
+                        )
+                        ordering_unsafe = True
+                        break
+
+                    if (
+                        previous_entered_at is not None
+                        and entered_at > previous_entered_at
+                    ):
+                        result.errors += 1
+                        result.status = "error"
+                        result.termination_reason = "ordering_unsafe"
+                        error_message = (
+                            "entered_at ordering increased at card {}".format(
+                                hit.sios_id
+                            )
+                        )
+                        ordering_unsafe = True
+                        break
+                    previous_entered_at = entered_at
+
+                    source_date = entered_at.date()
+                    if source_date < since:
+                        result.cards_skipped_too_old += 1
+                    elif source_date > until:
+                        page_all_too_old = False
+                        result.cards_skipped_too_new += 1
+                    else:
+                        page_all_too_old = False
+                        result.cards_in_window += 1
+                        if record is None:
+                            result.existing_cards += 1
+                            self.storage.add_keyword_match(hit.sios_id, keyword)
+                        else:
+                            record.matched_keywords = [keyword]
+                            stored = self.storage.upsert_card(
+                                record, run_id=run_id
+                            )
+                            _count_outcome(result, stored.status)
+
+                    if record is not None and existing is not None and not (
+                        since <= source_date <= until
+                    ):
+                        record.matched_keywords = [keyword]
+                        self.storage.upsert_card(record)
+
+                seen_ids.update(decision.new_ids)
+                previous_ids = set(dict.fromkeys(page_ids))
+                logger.info(
+                    "window_search_page",
+                    extra=log_extra(
+                        keyword=keyword,
+                        page=page,
+                        cards_on_page=len(set(page_ids)),
+                        cards_encountered=result.cards_encountered,
+                        cards_in_window=result.cards_in_window,
+                        page_all_too_old=page_all_too_old,
+                        ordering_unsafe=ordering_unsafe,
+                    ),
+                )
+                if ordering_unsafe:
+                    break
+                if page_all_too_old:
+                    result.termination_reason = "window_passed"
+                    break
+                page += 1
+            else:
+                result.termination_reason = "max_pages"
+
+            result.unique_cards = result.cards_in_window
+            if result.status != "error":
+                result.status = "ok" if result.errors == 0 else "partial"
+            self._persist_run(
+                run_id,
+                result,
+                status=result.status,
+                error=error_message,
+            )
+        except Exception as exc:
+            result.status = "error"
+            result.errors += 1
+            logger.exception(
+                "collect_keyword_window_failed",
+                extra=log_extra(keyword=keyword),
+            )
+            self._persist_run(
+                run_id,
+                result,
+                status="error",
+                error=str(exc),
+            )
+
+        logger.info(
+            "run_end",
+            extra=log_extra(
+                run_id=run_id,
+                keyword=keyword,
+                pages_processed=result.pages_processed,
+                cards_encountered=result.cards_encountered,
+                cards_in_window=result.cards_in_window,
+                new_cards=result.new_cards,
+                known_cards_skipped=result.known_cards_skipped,
+                detail_pages_fetched=result.detail_pages_fetched,
+                errors=result.errors,
+                stop_reason=result.stop_reason,
+                status=result.status,
+            ),
+        )
+        return result
+
     def collect_card_id(self, sios_id: int) -> KeywordRunResult:
         run_id = self.storage.start_run(keyword=None)
         result = KeywordRunResult(keyword="(card-id)", run_id=run_id)
@@ -315,6 +589,14 @@ def print_summary(result: KeywordRunResult) -> None:
         print(f"Stop reason: {result.stop_reason}")
     if result.reported_total is not None:
         print(f"SIOS reported total: {result.reported_total}")
+    if result.window_start is not None:
+        print(f"Window: {result.window_start} through {result.window_end}")
+        print(f"Cards encountered: {result.cards_encountered}")
+        print(f"Cards inside window: {result.cards_in_window}")
+        print(f"Cards skipped as too old: {result.cards_skipped_too_old}")
+        print(f"Cards skipped as too new: {result.cards_skipped_too_new}")
+        print(f"Known cards skipped: {result.known_cards_skipped}")
+        print(f"Detail pages fetched: {result.detail_pages_fetched}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -328,6 +610,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     source.add_argument("--card-id", type=int, help="Fetch a single public card by numeric SIOS ID.")
     parser.add_argument("--max-pages", type=int, default=None, help="Safety cap on search pages.")
+    parser.add_argument(
+        "--since",
+        type=parse_cli_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Collect by inclusive SIOS entered_at date from this day.",
+    )
+    parser.add_argument(
+        "--until",
+        type=parse_cli_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Inclusive entered_at end date (defaults to today with --since).",
+    )
     parser.add_argument("--config", type=Path, default=None, help="Path to collector.yaml.")
     parser.add_argument("--keywords-file", type=Path, default=None, help="Path to keywords.yaml.")
     parser.add_argument("--delay", type=float, default=None, help="Seconds between HTTP requests.")
@@ -357,7 +653,18 @@ def combine_keyword_runs(parts: list[KeywordRunResult], unique_cards: int) -> Ke
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.until is not None and args.since is None:
+        parser.error("--until requires --since")
+    if args.since is not None and not args.keyword:
+        parser.error("--since/--until currently require --keyword")
+    if (
+        args.since is not None
+        and args.until is not None
+        and args.until < args.since
+    ):
+        parser.error("--until must be on or after --since")
     configure_logging(args.log_level)
     settings = load_settings(args.config)
     if args.delay is not None:
@@ -382,7 +689,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             print_summary(result)
             return 1 if result.status == "error" else 0
         if args.keyword:
-            result = collector.collect_keyword(args.keyword, max_pages=args.max_pages)
+            if args.since is not None:
+                result = collector.collect_keyword_window(
+                    args.keyword,
+                    since=args.since,
+                    until=args.until or date.today(),
+                    max_pages=args.max_pages,
+                )
+            else:
+                result = collector.collect_keyword(
+                    args.keyword, max_pages=args.max_pages
+                )
             print_summary(result)
             return 1 if result.status == "error" else 0
         keywords = flatten_keywords(load_keyword_groups(args.keywords_file))

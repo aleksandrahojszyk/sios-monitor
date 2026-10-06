@@ -68,6 +68,29 @@ crawling requires the approval noted above.
 
 Cards are never deleted because they disappear from one keyword result.
 
+## Date-bounded runs
+
+Use `--since YYYY-MM-DD` and optionally `--until YYYY-MM-DD` for a capped
+recent-period collection. Both boundaries are inclusive.
+
+The date basis is the public card's `Data wprowadzenia` (`entered_at`), not the
+collector's `first_seen_at` / `last_seen_at`. In the validated 300-card `bóbr`
+sample:
+
+- `entered_at` was present on 300/300 cards and strictly newest-first;
+- `published_at` was complete but had 31 adjacent ordering inversions;
+- the result-list date was present on 183/300 cards and matched
+  `received_at`, not publication/entry time.
+
+SIOS does not document default ordering as a contract. A bounded run therefore
+checks `entered_at` ordering while traversing. It stops with `WINDOW_PASSED`
+after a complete page is older than the start date. Missing dates or an
+ordering increase stop the run with `ORDERING_UNSAFE`; the collector does not
+fall back to an unbounded historical crawl.
+
+Known cards with a stored `entered_at` are not detail-fetched again. Continue
+to use `--max-pages` as a separate operational safety cap.
+
 ## Personal data
 
 Detail pages include clerk names (`Informacje wprowadził/a`). Treat the SQLite file

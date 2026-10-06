@@ -6,6 +6,9 @@ from typing import Any, Optional
 
 DETAIL_PATH = "/documents/details/id/{sios_id}"
 SEARCH_PATH = "/search/common"
+# Increment when normalized fields or parser semantics change. Existing cards
+# then establish a new baseline instead of emitting source-data CHANGED events.
+CARD_PARSER_VERSION = "2"
 
 
 def detail_url(base_url: str, sios_id: int) -> str:
@@ -58,6 +61,7 @@ class CardRecord:
     matched_keywords: list[str]
     source_url: str
     raw_fields: dict[str, Any]
+    parser_version: str = CARD_PARSER_VERSION
     search_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_jsonable(self) -> dict[str, Any]:
@@ -74,6 +78,7 @@ class CardRecord:
             "matched_keywords": list(self.matched_keywords),
             "source_url": self.source_url,
             "raw_fields": self.raw_fields,
+            "parser_version": self.parser_version,
             "search_metadata": self.search_metadata,
         }
 

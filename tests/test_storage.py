@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from src.sios.models import CardRecord
-from src.sios.storage import STATUS_CHANGED, STATUS_NEW, STATUS_UNCHANGED, Storage
+from src.sios.storage import (
+    CHANGE_ORIGIN_PARSER_BASELINE,
+    CHANGE_ORIGIN_SOURCE,
+    STATUS_CHANGED,
+    STATUS_NEW,
+    STATUS_UNCHANGED,
+    Storage,
+)
 
 
 def sample_card(sios_id: int, keyword: str, name: str = "Decyzja") -> CardRecord:
@@ -163,6 +170,57 @@ def test_observations_record_new_unchanged_and_changed(
         "old": "Decyzja",
         "new": "Decyzja zaktualizowana",
     }
+    assert observations[2]["change_origin"] == CHANGE_ORIGIN_SOURCE
+
+
+def test_parser_version_change_establishes_baseline_before_source_changes(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "sios.sqlite")
+
+    original = sample_card(449913, "bóbr", "Decyzja")
+    original.parser_version = "1"
+    run_new = storage.start_run("bóbr")
+    assert storage.upsert_card(original, run_id=run_new).status == STATUS_NEW
+    first_seen = storage.get_card(449913)["first_seen_at"]
+
+    parser_evolved = sample_card(449913, "bóbr", "Decyzja po nowym parserze")
+    parser_evolved.parser_version = "2"
+    parser_evolved.raw_fields["Nowe pole parsera"] = "wartość"
+    run_baseline = storage.start_run("bóbr")
+    baseline = storage.upsert_card(parser_evolved, run_id=run_baseline)
+    assert baseline.status == STATUS_UNCHANGED
+    assert baseline.change_origin == CHANGE_ORIGIN_PARSER_BASELINE
+    assert "document_name" in baseline.changed_fields
+    assert "raw_fields.Nowe pole parsera" in baseline.changed_fields
+    after_baseline = storage.get_card(449913)
+    assert after_baseline["parser_version"] == "2"
+    assert after_baseline["first_seen_at"] == first_seen
+
+    source_changed = sample_card(449913, "bóbr", "Rzeczywista zmiana SIOS")
+    source_changed.parser_version = "2"
+    source_changed.raw_fields["Nowe pole parsera"] = "wartość"
+    run_changed = storage.start_run("bóbr")
+    changed = storage.upsert_card(source_changed, run_id=run_changed)
+    assert changed.status == STATUS_CHANGED
+    assert changed.change_origin == CHANGE_ORIGIN_SOURCE
+    assert changed.changed_fields["document_name"] == {
+        "old": "Decyzja po nowym parserze",
+        "new": "Rzeczywista zmiana SIOS",
+    }
+
+    observations = storage.observations_for(449913)
+    assert [item["status"] for item in observations] == [
+        STATUS_NEW,
+        STATUS_UNCHANGED,
+        STATUS_CHANGED,
+    ]
+    assert [item["parser_version"] for item in observations] == ["1", "2", "2"]
+    assert [item["change_origin"] for item in observations] == [
+        None,
+        CHANGE_ORIGIN_PARSER_BASELINE,
+        CHANGE_ORIGIN_SOURCE,
+    ]
 
 
 def test_finish_run_stores_change_counts(tmp_path: Path) -> None:
@@ -179,17 +237,27 @@ def test_finish_run_stores_change_counts(tmp_path: Path) -> None:
         error_count=0,
         reported_total=3115,
         stop_reason="MAX_PAGES",
+        cards_encountered=5,
+        cards_in_window=3,
+        cards_skipped_too_old=1,
+        cards_skipped_too_new=1,
+        known_cards_skipped=2,
+        detail_pages_fetched=3,
         status="ok",
     )
     row = storage.conn.execute(
         """
         SELECT new_cards, changed_cards, unchanged_cards, existing_cards,
-               error_count, reported_total, stop_reason
+               error_count, reported_total, stop_reason, cards_encountered,
+               cards_in_window, cards_skipped_too_old, cards_skipped_too_new,
+               known_cards_skipped, detail_pages_fetched
         FROM collection_runs WHERE run_id = ?
         """,
         (run_id,),
     ).fetchone()
-    assert tuple(row) == (1, 1, 1, 2, 0, 3115, "MAX_PAGES")
+    assert tuple(row) == (
+        1, 1, 1, 2, 0, 3115, "MAX_PAGES", 5, 3, 1, 1, 2, 3
+    )
 
 
 def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
@@ -223,6 +291,14 @@ def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
     assert "error_count" in columns
     assert "reported_total" in columns
     assert "stop_reason" in columns
+    assert "window_start" in columns
+    assert "window_end" in columns
+    assert "cards_encountered" in columns
+    assert "cards_in_window" in columns
+    assert "cards_skipped_too_old" in columns
+    assert "cards_skipped_too_new" in columns
+    assert "known_cards_skipped" in columns
+    assert "detail_pages_fetched" in columns
     tables = {
         row["name"]
         for row in storage.conn.execute(
@@ -231,3 +307,13 @@ def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
     }
     assert "card_observations" in tables
     assert "cards" in tables
+    card_columns = {
+        row["name"] for row in storage.conn.execute("PRAGMA table_info(cards)")
+    }
+    observation_columns = {
+        row["name"]
+        for row in storage.conn.execute("PRAGMA table_info(card_observations)")
+    }
+    assert "parser_version" in card_columns
+    assert "parser_version" in observation_columns
+    assert "change_origin" in observation_columns

@@ -13,6 +13,8 @@ from .models import CardRecord
 STATUS_NEW = "NEW"
 STATUS_CHANGED = "CHANGED"
 STATUS_UNCHANGED = "UNCHANGED"
+CHANGE_ORIGIN_SOURCE = "SOURCE"
+CHANGE_ORIGIN_PARSER_BASELINE = "PARSER_BASELINE"
 
 # Search-hit context, not the public card. Keyword overlap lives in keyword_matches.
 _IGNORED_RAW_KEYS = {"_search"}
@@ -89,6 +91,7 @@ class UpsertResult:
     status: str
     content_hash: str
     changed_fields: Optional[dict[str, Any]] = None
+    change_origin: Optional[str] = None
 
 
 class Storage:
@@ -119,7 +122,8 @@ class Storage:
                 source_url TEXT NOT NULL,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
-                raw_fields_json TEXT NOT NULL DEFAULT '{}'
+                raw_fields_json TEXT NOT NULL DEFAULT '{}',
+                parser_version TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS keyword_matches (
@@ -143,6 +147,14 @@ class Storage:
                 error_count INTEGER NOT NULL DEFAULT 0,
                 reported_total INTEGER,
                 stop_reason TEXT,
+                window_start TEXT,
+                window_end TEXT,
+                cards_encountered INTEGER NOT NULL DEFAULT 0,
+                cards_in_window INTEGER NOT NULL DEFAULT 0,
+                cards_skipped_too_old INTEGER NOT NULL DEFAULT 0,
+                cards_skipped_too_new INTEGER NOT NULL DEFAULT 0,
+                known_cards_skipped INTEGER NOT NULL DEFAULT 0,
+                detail_pages_fetched INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 error TEXT
             );
@@ -155,6 +167,11 @@ class Storage:
                 status TEXT NOT NULL CHECK (status IN ('NEW', 'CHANGED', 'UNCHANGED')),
                 content_hash TEXT NOT NULL,
                 changed_fields_json TEXT,
+                parser_version TEXT NOT NULL,
+                change_origin TEXT CHECK (
+                    change_origin IS NULL OR
+                    change_origin IN ('SOURCE', 'PARSER_BASELINE')
+                ),
                 FOREIGN KEY (run_id) REFERENCES collection_runs(run_id),
                 FOREIGN KEY (sios_id) REFERENCES cards(sios_id)
             );
@@ -166,6 +183,7 @@ class Storage:
             """
         )
         self._migrate_collection_runs()
+        self._migrate_parser_versions()
         self.conn.commit()
 
     def _migrate_collection_runs(self) -> None:
@@ -193,14 +211,62 @@ class Storage:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN reported_total INTEGER")
         if "stop_reason" not in columns:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN stop_reason TEXT")
+        if "window_start" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN window_start TEXT")
+        if "window_end" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN window_end TEXT")
+        for column in (
+            "cards_encountered",
+            "cards_in_window",
+            "cards_skipped_too_old",
+            "cards_skipped_too_new",
+            "known_cards_skipped",
+            "detail_pages_fetched",
+        ):
+            if column not in columns:
+                self.conn.execute(
+                    "ALTER TABLE collection_runs ADD COLUMN {} "
+                    "INTEGER NOT NULL DEFAULT 0".format(column)
+                )
 
-    def start_run(self, keyword: Optional[str]) -> int:
+    def _migrate_parser_versions(self) -> None:
+        card_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(cards)")
+        }
+        if "parser_version" not in card_columns:
+            # NULL means this current state predates explicit parser versioning.
+            # Its next fetch becomes a parser baseline, not a source change.
+            self.conn.execute("ALTER TABLE cards ADD COLUMN parser_version TEXT")
+
+        observation_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(card_observations)")
+        }
+        if "parser_version" not in observation_columns:
+            # Historical observations remain NULL and are not rewritten.
+            self.conn.execute(
+                "ALTER TABLE card_observations ADD COLUMN parser_version TEXT"
+            )
+        if "change_origin" not in observation_columns:
+            self.conn.execute(
+                "ALTER TABLE card_observations ADD COLUMN change_origin TEXT"
+            )
+
+    def start_run(
+        self,
+        keyword: Optional[str],
+        *,
+        window_start: Optional[str] = None,
+        window_end: Optional[str] = None,
+    ) -> int:
         cur = self.conn.execute(
             """
-            INSERT INTO collection_runs (started_at, keyword, status)
-            VALUES (?, ?, 'running')
+            INSERT INTO collection_runs (
+                started_at, keyword, window_start, window_end, status
+            )
+            VALUES (?, ?, ?, ?, 'running')
             """,
-            (utc_now(), keyword),
+            (utc_now(), keyword, window_start, window_end),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -220,6 +286,12 @@ class Storage:
         error_count: int = 0,
         reported_total: Optional[int] = None,
         stop_reason: Optional[str] = None,
+        cards_encountered: int = 0,
+        cards_in_window: int = 0,
+        cards_skipped_too_old: int = 0,
+        cards_skipped_too_new: int = 0,
+        known_cards_skipped: int = 0,
+        detail_pages_fetched: int = 0,
     ) -> None:
         self.conn.execute(
             """
@@ -227,7 +299,10 @@ class Storage:
             SET finished_at = ?, pages_processed = ?, cards_found = ?,
                 new_cards = ?, changed_cards = ?, unchanged_cards = ?,
                 existing_cards = ?, error_count = ?, reported_total = ?,
-                stop_reason = ?, status = ?, error = ?
+                stop_reason = ?, cards_encountered = ?, cards_in_window = ?,
+                cards_skipped_too_old = ?, cards_skipped_too_new = ?,
+                known_cards_skipped = ?, detail_pages_fetched = ?,
+                status = ?, error = ?
             WHERE run_id = ?
             """,
             (
@@ -241,6 +316,12 @@ class Storage:
                 error_count,
                 reported_total,
                 stop_reason,
+                cards_encountered,
+                cards_in_window,
+                cards_skipped_too_old,
+                cards_skipped_too_new,
+                known_cards_skipped,
+                detail_pages_fetched,
                 status,
                 error,
                 run_id,
@@ -263,6 +344,7 @@ class Storage:
         payload = content_payload_from_record(record)
         digest = content_hash(payload)
         changed_fields: Optional[dict[str, Any]] = None
+        change_origin: Optional[str] = None
         if existing is None:
             status = STATUS_NEW
             self.conn.execute(
@@ -270,8 +352,8 @@ class Storage:
                 INSERT INTO cards (
                     sios_id, card_number, year, document_name, document_type,
                     case_reference, authority, location, dates_json, source_url,
-                    first_seen_at, last_seen_at, raw_fields_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    first_seen_at, last_seen_at, raw_fields_json, parser_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.sios_id,
@@ -287,12 +369,25 @@ class Storage:
                     now,
                     now,
                     json.dumps(record.raw_fields, ensure_ascii=False),
+                    record.parser_version,
                 ),
             )
         else:
             changed_fields = diff_content(content_payload_from_row(existing), payload) or None
-            if changed_fields:
+            parser_changed = existing["parser_version"] != record.parser_version
+            if parser_changed:
+                # Parser evolution may add, remove, or reinterpret fields. Store
+                # the refreshed payload as a baseline without claiming SIOS
+                # changed. The diff remains available for audit.
+                status = STATUS_UNCHANGED
+                change_origin = CHANGE_ORIGIN_PARSER_BASELINE
+            elif changed_fields:
                 status = STATUS_CHANGED
+                change_origin = CHANGE_ORIGIN_SOURCE
+            else:
+                status = STATUS_UNCHANGED
+
+            if parser_changed or changed_fields:
                 self.conn.execute(
                     """
                     UPDATE cards SET
@@ -306,7 +401,8 @@ class Storage:
                         dates_json = ?,
                         source_url = ?,
                         last_seen_at = ?,
-                        raw_fields_json = ?
+                        raw_fields_json = ?,
+                        parser_version = ?
                     WHERE sios_id = ?
                     """,
                     (
@@ -321,11 +417,11 @@ class Storage:
                         record.source_url,
                         now,
                         json.dumps(record.raw_fields, ensure_ascii=False),
+                        record.parser_version,
                         record.sios_id,
                     ),
                 )
             else:
-                status = STATUS_UNCHANGED
                 self.conn.execute(
                     "UPDATE cards SET last_seen_at = ? WHERE sios_id = ?",
                     (now, record.sios_id),
@@ -342,8 +438,9 @@ class Storage:
             self.conn.execute(
                 """
                 INSERT INTO card_observations (
-                    run_id, sios_id, observed_at, status, content_hash, changed_fields_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    run_id, sios_id, observed_at, status, content_hash,
+                    changed_fields_json, parser_version, change_origin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -354,6 +451,8 @@ class Storage:
                     json.dumps(changed_fields, ensure_ascii=False, sort_keys=True)
                     if changed_fields
                     else None,
+                    record.parser_version,
+                    change_origin,
                 ),
             )
         self.conn.commit()
@@ -363,6 +462,7 @@ class Storage:
             status=status,
             content_hash=digest,
             changed_fields=changed_fields,
+            change_origin=change_origin,
         )
 
     def add_keyword_match(self, sios_id: int, keyword: str) -> None:
@@ -378,7 +478,8 @@ class Storage:
     def observations_for(self, sios_id: int) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT id, run_id, sios_id, observed_at, status, content_hash, changed_fields_json
+            SELECT id, run_id, sios_id, observed_at, status, content_hash,
+                   changed_fields_json, parser_version, change_origin
             FROM card_observations
             WHERE sios_id = ?
             ORDER BY id
