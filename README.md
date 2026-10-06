@@ -39,6 +39,7 @@ python -m src.sios.collector --all-keywords
 python -m src.sios.collector --card-id 449913
 python -m src.sios.collector --keyword "bóbr" \
   --since 2026-08-06 --until 2026-10-06 --max-pages 20
+python -m src.sios.collector --keyword "bóbr" --incremental --max-pages 10
 ```
 
 Useful flags:
@@ -46,6 +47,7 @@ Useful flags:
 - `--max-pages N` — hard cap on search pages
 - `--since YYYY-MM-DD` — inclusive bounded collection using SIOS `entered_at`
 - `--until YYYY-MM-DD` — inclusive end date; defaults to today with `--since`
+- `--incremental` — derive the window from the last safe bounded run
 - `--delay 2.0` — seconds between requests
 - `--no-raw` — skip saving HTML snapshots
 - `--log-level DEBUG`
@@ -77,6 +79,26 @@ non-increasing and stops with `ORDERING_UNSAFE` if the undocumented ordering
 assumption fails; it does not silently continue into a historical crawl.
 
 Keep an explicit `--max-pages` safety cap for live bounded runs.
+
+### Incremental monitoring
+
+`--incremental` uses the `window_end` of the latest successful, completely
+traversed bounded run for the same keyword. It subtracts one day for overlap
+and uses today as the new end date:
+
+```
+window_start = previous window_end - 1 day
+window_end = today
+```
+
+This watermark model automatically expands after missed weeks. It does not
+fall back to a fixed seven-day window. Known overlap cards use their stored
+`entered_at`, so they do not trigger detail requests or duplicate card rows.
+
+Failed, partial, `MAX_PAGES`, `HTTP_ERROR`, and `ORDERING_UNSAFE` runs never
+advance the watermark. If no safe prior bounded run exists, automatic mode
+refuses to guess and requires an explicit `--since`. Supplying `--since` takes
+precedence over `--incremental`.
 
 ## Data
 

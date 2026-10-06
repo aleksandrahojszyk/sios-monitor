@@ -149,6 +149,9 @@ class Storage:
                 stop_reason TEXT,
                 window_start TEXT,
                 window_end TEXT,
+                window_mode TEXT,
+                watermark_used TEXT,
+                overlap_days INTEGER NOT NULL DEFAULT 0,
                 cards_encountered INTEGER NOT NULL DEFAULT 0,
                 cards_in_window INTEGER NOT NULL DEFAULT 0,
                 cards_skipped_too_old INTEGER NOT NULL DEFAULT 0,
@@ -215,6 +218,15 @@ class Storage:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN window_start TEXT")
         if "window_end" not in columns:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN window_end TEXT")
+        if "window_mode" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN window_mode TEXT")
+        if "watermark_used" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN watermark_used TEXT")
+        if "overlap_days" not in columns:
+            self.conn.execute(
+                "ALTER TABLE collection_runs ADD COLUMN overlap_days "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         for column in (
             "cards_encountered",
             "cards_in_window",
@@ -258,18 +270,54 @@ class Storage:
         *,
         window_start: Optional[str] = None,
         window_end: Optional[str] = None,
+        window_mode: Optional[str] = None,
+        watermark_used: Optional[str] = None,
+        overlap_days: int = 0,
     ) -> int:
         cur = self.conn.execute(
             """
             INSERT INTO collection_runs (
-                started_at, keyword, window_start, window_end, status
+                started_at, keyword, window_start, window_end, window_mode,
+                watermark_used, overlap_days, status
             )
-            VALUES (?, ?, ?, ?, 'running')
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
             """,
-            (utc_now(), keyword, window_start, window_end),
+            (
+                utc_now(),
+                keyword,
+                window_start,
+                window_end,
+                window_mode,
+                watermark_used,
+                overlap_days,
+            ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def last_successful_window_end(self, keyword: str) -> Optional[str]:
+        """Return the latest complete bounded-run end date for one keyword.
+
+        Incomplete caps and failed/partial runs must never advance the
+        incremental watermark.
+        """
+        row = self.conn.execute(
+            """
+            SELECT window_end
+            FROM collection_runs
+            WHERE keyword = ?
+              AND status = 'ok'
+              AND window_end IS NOT NULL
+              AND stop_reason IN (
+                  'WINDOW_PASSED', 'EMPTY_PAGE',
+                  'REPEATED_PAGE', 'NO_NEW_IDS'
+              )
+            ORDER BY finished_at DESC, run_id DESC
+            LIMIT 1
+            """,
+            (keyword,),
+        ).fetchone()
+        return str(row["window_end"]) if row is not None else None
 
     def finish_run(
         self,

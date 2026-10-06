@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from src.sios.client import SiosHttpError
 from src.sios.collector import (
+    NoWatermarkError,
     STOP_EMPTY_PAGE,
     STOP_HTTP_ERROR,
     STOP_MAX_PAGES,
@@ -13,6 +16,8 @@ from src.sios.collector import (
     STOP_REPEATED_PAGE,
     STOP_ORDERING_UNSAFE,
     STOP_WINDOW_PASSED,
+    WINDOW_MODE_AUTOMATIC,
+    WINDOW_MODE_EXPLICIT,
     Collector,
     combine_keyword_runs,
     main,
@@ -171,6 +176,25 @@ def make_window_collector(
     return Collector(settings, storage, client), storage, client  # type: ignore[arg-type]
 
 
+def store_known_card_three(storage: Storage) -> None:
+    storage.upsert_card(
+        CardRecord(
+            sios_id=3,
+            card_number="3/2026",
+            year=2026,
+            document_name="Decyzja 3",
+            document_type="decyzje",
+            case_reference="ZNAK-3",
+            authority="Organ",
+            location="mazowieckie / warszawski / Warszawa",
+            dates={"entered_at": "2026-10-05 09:00:00"},
+            matched_keywords=["bóbr"],
+            source_url="https://system.sios.pl/documents/details/id/3",
+            raw_fields={"Data wprowadzenia": "2026-10-05 09:00:00"},
+        )
+    )
+
+
 def test_repeated_final_page_does_not_loop(tmp_path: Path) -> None:
     collector, storage, client = make_collector(tmp_path)
     hits, result = collector.search("bóbr")
@@ -226,6 +250,26 @@ def _latest_run(storage: Storage):
     return storage.conn.execute(
         "SELECT * FROM collection_runs ORDER BY run_id DESC LIMIT 1"
     ).fetchone()
+
+
+def seed_successful_window(
+    storage: Storage, keyword: str, window_end: str
+) -> int:
+    run_id = storage.start_run(
+        keyword,
+        window_start="2026-01-01",
+        window_end=window_end,
+        window_mode=WINDOW_MODE_EXPLICIT,
+    )
+    storage.finish_run(
+        run_id,
+        pages_processed=1,
+        cards_found=0,
+        new_cards=0,
+        status="ok",
+        stop_reason=STOP_WINDOW_PASSED,
+    )
+    return run_id
 
 
 def test_max_pages_is_stored_on_the_run(tmp_path: Path) -> None:
@@ -332,21 +376,7 @@ def test_date_bounded_collection_includes_boundary_and_stops_on_old_page(
     tmp_path: Path,
 ) -> None:
     collector, storage, client = make_window_collector(tmp_path)
-    known = CardRecord(
-        sios_id=3,
-        card_number="3/2026",
-        year=2026,
-        document_name="Decyzja 3",
-        document_type="decyzje",
-        case_reference="ZNAK-3",
-        authority="Organ",
-        location="mazowieckie / warszawski / Warszawa",
-        dates={"entered_at": "2026-10-05 09:00:00"},
-        matched_keywords=["bóbr"],
-        source_url="https://system.sios.pl/documents/details/id/3",
-        raw_fields={"Data wprowadzenia": "2026-10-05 09:00:00"},
-    )
-    storage.upsert_card(known)
+    store_known_card_three(storage)
 
     result = collector.collect_keyword_window(
         "bóbr",
@@ -435,6 +465,91 @@ def test_date_bounded_collection_fails_closed_when_ordering_is_unsafe(
     assert _latest_run(storage)["stop_reason"] == STOP_ORDERING_UNSAFE
 
 
+def test_automatic_incremental_run_uses_watermark_overlap_and_skips_known(
+    tmp_path: Path,
+) -> None:
+    collector, storage, client = make_window_collector(tmp_path)
+    store_known_card_three(storage)
+    seed_successful_window(storage, "bóbr", "2026-10-05")
+
+    result = collector.collect_keyword_incremental(
+        "bóbr",
+        until=date(2026, 10, 6),
+    )
+
+    assert result.window_mode == WINDOW_MODE_AUTOMATIC
+    assert result.watermark_used == "2026-10-05"
+    assert result.overlap_days == 1
+    assert result.window_start == "2026-10-04"
+    assert result.window_end == "2026-10-06"
+    assert result.new_cards == 1
+    assert result.existing_cards == 1
+    assert result.known_cards_skipped == 1
+    assert client.detail_calls == [4, 2, 1]
+    run = _latest_run(storage)
+    assert run["window_mode"] == WINDOW_MODE_AUTOMATIC
+    assert run["watermark_used"] == "2026-10-05"
+    assert run["overlap_days"] == 1
+
+
+def test_automatic_incremental_overlap_includes_boundary_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    collector, storage, client = make_window_collector(tmp_path)
+    store_known_card_three(storage)
+    seed_successful_window(storage, "bóbr", "2026-10-05")
+    client.details[2] = detail_page(2, "2026-10-04 00:00:00")
+
+    result = collector.collect_keyword_incremental(
+        "bóbr",
+        until=date(2026, 10, 6),
+    )
+
+    assert result.cards_in_window == 3
+    assert result.new_cards == 2
+    assert storage.get_card(2) is not None
+    assert storage.card_count() == 3
+    assert len({row["sios_id"] for row in storage.observations_for(2)}) == 1
+
+
+@pytest.mark.parametrize(
+    ("watermark", "expected_start"),
+    [
+        ("2026-09-29", "2026-09-28"),  # One missed weekly run.
+        ("2026-09-15", "2026-09-14"),  # Three missed weekly runs.
+    ],
+)
+def test_automatic_incremental_expands_from_old_watermark(
+    tmp_path: Path, watermark: str, expected_start: str
+) -> None:
+    collector, storage, _ = make_window_collector(tmp_path)
+    seed_successful_window(storage, "bóbr", watermark)
+
+    result = collector.collect_keyword_incremental(
+        "bóbr",
+        until=date(2026, 10, 6),
+    )
+
+    assert result.watermark_used == watermark
+    assert result.window_start == expected_start
+    assert result.window_end == "2026-10-06"
+
+
+def test_automatic_incremental_refuses_to_guess_without_watermark(
+    tmp_path: Path,
+) -> None:
+    collector, _, client = make_window_collector(tmp_path)
+
+    with pytest.raises(NoWatermarkError):
+        collector.collect_keyword_incremental(
+            "bóbr",
+            until=date(2026, 10, 6),
+        )
+
+    assert client.search_calls == []
+    assert client.detail_calls == []
+
+
 def _write_config(tmp_path: Path) -> Path:
     config = tmp_path / "collector.yaml"
     config.write_text(
@@ -517,6 +632,7 @@ def test_keyword_cli_explicit_since_until_uses_bounded_mode(
         [
             "--keyword",
             "bóbr",
+            "--incremental",
             "--since",
             "2026-08-06",
             "--until",
@@ -533,9 +649,38 @@ def test_keyword_cli_explicit_since_until_uses_bounded_mode(
     run = _latest_run(storage)
     assert run["window_start"] == "2026-08-06"
     assert run["window_end"] == "2026-10-06"
+    assert run["window_mode"] == WINDOW_MODE_EXPLICIT
+    assert run["watermark_used"] is None
+    assert run["overlap_days"] == 0
     assert run["stop_reason"] == STOP_WINDOW_PASSED
     assert run["cards_in_window"] == 3
     assert storage.card_count() == 3
+
+
+def test_incremental_cli_without_watermark_returns_nonzero(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = WindowClient()
+    monkeypatch.setattr("src.sios.collector.SiosClient", lambda **kwargs: client)
+    config = _write_config(tmp_path)
+
+    code = main(
+        [
+            "--keyword",
+            "bóbr",
+            "--incremental",
+            "--until",
+            "2026-10-06",
+            "--config",
+            str(config),
+            "--log-level",
+            "ERROR",
+        ]
+    )
+
+    assert code == 2
+    assert client.search_calls == []
+    assert client.detail_calls == []
 
 
 def test_all_keywords_summary_is_distinct_and_failure_stays_nonzero(

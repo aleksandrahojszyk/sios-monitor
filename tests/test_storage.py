@@ -260,6 +260,62 @@ def test_finish_run_stores_change_counts(tmp_path: Path) -> None:
     )
 
 
+def test_failed_or_incomplete_run_does_not_advance_watermark(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "sios.sqlite")
+    successful = storage.start_run(
+        "bóbr",
+        window_start="2026-08-01",
+        window_end="2026-09-01",
+        window_mode="EXPLICIT",
+    )
+    storage.finish_run(
+        successful,
+        pages_processed=2,
+        cards_found=10,
+        new_cards=10,
+        status="ok",
+        stop_reason="WINDOW_PASSED",
+    )
+    failed = storage.start_run(
+        "bóbr",
+        window_start="2026-08-31",
+        window_end="2026-10-01",
+        window_mode="AUTOMATIC",
+        watermark_used="2026-09-01",
+        overlap_days=1,
+    )
+    storage.finish_run(
+        failed,
+        pages_processed=1,
+        cards_found=0,
+        new_cards=0,
+        status="error",
+        error_count=1,
+        stop_reason="ORDERING_UNSAFE",
+    )
+    capped = storage.start_run(
+        "bóbr",
+        window_start="2026-08-31",
+        window_end="2026-10-02",
+        window_mode="AUTOMATIC",
+        watermark_used="2026-09-01",
+        overlap_days=1,
+    )
+    storage.finish_run(
+        capped,
+        pages_processed=1,
+        cards_found=2,
+        new_cards=2,
+        status="ok",
+        stop_reason="MAX_PAGES",
+    )
+
+    assert storage.last_successful_window_end("bóbr") == "2026-09-01"
+    assert storage.last_successful_window_end("Castor fiber") is None
+
+
 def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite"
     conn = sqlite3.connect(str(path))
@@ -293,6 +349,9 @@ def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
     assert "stop_reason" in columns
     assert "window_start" in columns
     assert "window_end" in columns
+    assert "window_mode" in columns
+    assert "watermark_used" in columns
+    assert "overlap_days" in columns
     assert "cards_encountered" in columns
     assert "cards_in_window" in columns
     assert "cards_skipped_too_old" in columns

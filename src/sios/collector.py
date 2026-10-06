@@ -5,7 +5,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +28,8 @@ STOP_COMPLETED = "COMPLETED"
 STOP_PARTIAL_DETAIL_FAILURE = "PARTIAL_DETAIL_FAILURE"
 STOP_WINDOW_PASSED = "WINDOW_PASSED"
 STOP_ORDERING_UNSAFE = "ORDERING_UNSAFE"
+WINDOW_MODE_EXPLICIT = "EXPLICIT"
+WINDOW_MODE_AUTOMATIC = "AUTOMATIC"
 
 _SEARCH_STOP_REASONS = {
     "empty_page": STOP_EMPTY_PAGE,
@@ -38,6 +40,10 @@ _SEARCH_STOP_REASONS = {
     "window_passed": STOP_WINDOW_PASSED,
     "ordering_unsafe": STOP_ORDERING_UNSAFE,
 }
+
+
+class NoWatermarkError(RuntimeError):
+    pass
 
 
 def apply_stop_reason(result: KeywordRunResult) -> None:
@@ -116,6 +122,9 @@ class KeywordRunResult:
     run_id: Optional[int] = None
     window_start: Optional[str] = None
     window_end: Optional[str] = None
+    window_mode: Optional[str] = None
+    watermark_used: Optional[str] = None
+    overlap_days: int = 0
     cards_encountered: int = 0
     cards_in_window: int = 0
     cards_skipped_too_old: int = 0
@@ -339,6 +348,9 @@ class Collector:
         since: date,
         until: date,
         max_pages: Optional[int] = None,
+        window_mode: str = WINDOW_MODE_EXPLICIT,
+        watermark_used: Optional[str] = None,
+        overlap_days: int = 0,
     ) -> KeywordRunResult:
         """Collect cards whose SIOS entry timestamp falls in an inclusive window.
 
@@ -354,12 +366,18 @@ class Collector:
             keyword,
             window_start=since.isoformat(),
             window_end=until.isoformat(),
+            window_mode=window_mode,
+            watermark_used=watermark_used,
+            overlap_days=overlap_days,
         )
         result = KeywordRunResult(
             keyword=keyword,
             run_id=run_id,
             window_start=since.isoformat(),
             window_end=until.isoformat(),
+            window_mode=window_mode,
+            watermark_used=watermark_used,
+            overlap_days=overlap_days,
         )
         logger.info(
             "run_start",
@@ -368,6 +386,9 @@ class Collector:
                 keyword=keyword,
                 window_start=result.window_start,
                 window_end=result.window_end,
+                window_mode=result.window_mode,
+                watermark_used=result.watermark_used,
+                overlap_days=result.overlap_days,
                 date_basis="entered_at",
             ),
         )
@@ -554,6 +575,39 @@ class Collector:
         )
         return result
 
+    def collect_keyword_incremental(
+        self,
+        keyword: str,
+        *,
+        until: Optional[date] = None,
+        max_pages: Optional[int] = None,
+    ) -> KeywordRunResult:
+        """Run from the last safe bounded watermark with a one-day overlap."""
+        watermark = self.storage.last_successful_window_end(keyword)
+        if watermark is None:
+            raise NoWatermarkError(
+                "No successful bounded run exists for {!r}; provide --since".format(
+                    keyword
+                )
+            )
+        try:
+            watermark_date = date.fromisoformat(watermark)
+        except ValueError:
+            raise NoWatermarkError(
+                "Stored watermark for {!r} is invalid: {}".format(
+                    keyword, watermark
+                )
+            )
+        return self.collect_keyword_window(
+            keyword,
+            since=watermark_date - timedelta(days=1),
+            until=until or date.today(),
+            max_pages=max_pages,
+            window_mode=WINDOW_MODE_AUTOMATIC,
+            watermark_used=watermark,
+            overlap_days=1,
+        )
+
     def collect_card_id(self, sios_id: int) -> KeywordRunResult:
         run_id = self.storage.start_run(keyword=None)
         result = KeywordRunResult(keyword="(card-id)", run_id=run_id)
@@ -591,6 +645,10 @@ def print_summary(result: KeywordRunResult) -> None:
         print(f"SIOS reported total: {result.reported_total}")
     if result.window_start is not None:
         print(f"Window: {result.window_start} through {result.window_end}")
+        print(f"Window mode: {result.window_mode}")
+        if result.watermark_used is not None:
+            print(f"Watermark used: {result.watermark_used}")
+            print(f"Overlap days: {result.overlap_days}")
         print(f"Cards encountered: {result.cards_encountered}")
         print(f"Cards inside window: {result.cards_in_window}")
         print(f"Cards skipped as too old: {result.cards_skipped_too_old}")
@@ -622,7 +680,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         default=None,
         metavar="YYYY-MM-DD",
-        help="Inclusive entered_at end date (defaults to today with --since).",
+        help="Inclusive entered_at end date (defaults to today in bounded modes).",
+    )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Derive --since from the last safe bounded run minus one day.",
     )
     parser.add_argument("--config", type=Path, default=None, help="Path to collector.yaml.")
     parser.add_argument("--keywords-file", type=Path, default=None, help="Path to keywords.yaml.")
@@ -655,10 +718,10 @@ def combine_keyword_runs(parts: list[KeywordRunResult], unique_cards: int) -> Ke
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.until is not None and args.since is None:
+    if args.until is not None and args.since is None and not args.incremental:
         parser.error("--until requires --since")
-    if args.since is not None and not args.keyword:
-        parser.error("--since/--until currently require --keyword")
+    if (args.since is not None or args.incremental) and not args.keyword:
+        parser.error("--since/--until/--incremental currently require --keyword")
     if (
         args.since is not None
         and args.until is not None
@@ -696,6 +759,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                     until=args.until or date.today(),
                     max_pages=args.max_pages,
                 )
+            elif args.incremental:
+                try:
+                    result = collector.collect_keyword_incremental(
+                        args.keyword,
+                        until=args.until,
+                        max_pages=args.max_pages,
+                    )
+                except NoWatermarkError as exc:
+                    logger.error(
+                        "incremental_watermark_missing",
+                        extra=log_extra(keyword=args.keyword, error=str(exc)),
+                    )
+                    return 2
             else:
                 result = collector.collect_keyword(
                     args.keyword, max_pages=args.max_pages

@@ -91,6 +91,22 @@ fall back to an unbounded historical crawl.
 Known cards with a stored `entered_at` are not detail-fetched again. Continue
 to use `--max-pages` as a separate operational safety cap.
 
+## Incremental watermark
+
+After a successful bounded baseline, use `--incremental` for subsequent runs.
+The watermark is the `window_end` of the latest safe, successful bounded run
+for the same keyword. The collector subtracts one day for overlap and defaults
+the new end to today.
+
+Only `ok` runs ending with `WINDOW_PASSED`, `EMPTY_PAGE`, `REPEATED_PAGE`, or
+`NO_NEW_IDS` are eligible watermarks. Failed/partial runs and safety-cap stops
+do not advance it. If no eligible run exists, the collector requires an
+explicit `--since` rather than assuming seven days.
+
+Run metadata records whether the window was `AUTOMATIC` or `EXPLICIT`, the
+watermark used, and the overlap days. Explicit `--since` always wins when both
+it and `--incremental` are supplied.
+
 ## Personal data
 
 Detail pages include clerk names (`Informacje wprowadził/a`). Treat the SQLite file
