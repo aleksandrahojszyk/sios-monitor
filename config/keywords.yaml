@@ -1,0 +1,19 @@
+# Editable keyword lists for SIOS public search.
+# Queries are run independently and results are unioned by numeric SIOS ID.
+# This is a starting vocabulary, not a complete species/case taxonomy.
+
+species:
+  - "bóbr"
+  - "bobry"
+  - "Castor fiber"
+  - "bobra europejskiego"
+
+protected_species:
+  - "zwierząt chronionych"
+  - "gatunków chronionych"
+
+interventions:
+  - "tama bobrowa"
+  - "tamy bobrowe"
+  - "żeremie"
+  - "odstrzał"

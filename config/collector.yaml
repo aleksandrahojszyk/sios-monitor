@@ -1,0 +1,15 @@
+# Operational settings for the public SIOS metadata collector.
+# Do not use undocumented page sizes as the default (research: UI offers 10–100).
+
+base_url: "https://system.sios.pl"
+user_agent: "sios-monitor/0.1 (public SIOS metadata collector; conservative pacing)"
+timeout_seconds: 30
+request_delay_seconds: 1.5
+max_retries: 4
+results_per_page: 30
+iid: 0
+save_raw_html: true
+sqlite_path: "data/normalized/sios.sqlite"
+raw_search_dir: "data/raw/search"
+raw_details_dir: "data/raw/details"
+max_pages: 1000
