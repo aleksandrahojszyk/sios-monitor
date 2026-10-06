@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -9,15 +10,85 @@ from typing import Any, Optional
 
 from .models import CardRecord
 
+STATUS_NEW = "NEW"
+STATUS_CHANGED = "CHANGED"
+STATUS_UNCHANGED = "UNCHANGED"
+
+# Search-hit context, not the public card. Keyword overlap lives in keyword_matches.
+_IGNORED_RAW_KEYS = {"_search"}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def content_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def _public_raw_fields(raw_fields: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in raw_fields.items() if key not in _IGNORED_RAW_KEYS}
+
+
+def content_payload_from_record(record: CardRecord) -> dict[str, Any]:
+    return {
+        "card_number": record.card_number,
+        "year": record.year,
+        "document_name": record.document_name,
+        "document_type": record.document_type,
+        "case_reference": record.case_reference,
+        "authority": record.authority,
+        "location": record.location,
+        "dates": record.dates,
+        "source_url": record.source_url,
+        "raw_fields": _public_raw_fields(record.raw_fields),
+    }
+
+
+def content_payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    raw_fields = json.loads(row["raw_fields_json"] or "{}")
+    return {
+        "card_number": row["card_number"],
+        "year": row["year"],
+        "document_name": row["document_name"],
+        "document_type": row["document_type"],
+        "case_reference": row["case_reference"],
+        "authority": row["authority"],
+        "location": row["location"],
+        "dates": json.loads(row["dates_json"] or "{}"),
+        "source_url": row["source_url"],
+        "raw_fields": _public_raw_fields(raw_fields),
+    }
+
+
+def diff_content(old: dict[str, Any], new: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Field paths whose canonical JSON differs. Object key order is not a change."""
+    changes: dict[str, dict[str, Any]] = {}
+
+    def walk(left: Any, right: Any, path: str) -> None:
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right), key=str):
+                child = "{}.{}".format(path, key) if path else str(key)
+                walk(left.get(key), right.get(key), child)
+            return
+        if _stable_json(left) != _stable_json(right):
+            changes[path] = {"old": left, "new": right}
+
+    walk(old, new, "")
+    return changes
 
 
 @dataclass
 class UpsertResult:
     created: bool
     sios_id: int
+    status: str
+    content_hash: str
+    changed_fields: Optional[dict[str, Any]] = None
 
 
 class Storage:
@@ -66,12 +137,62 @@ class Storage:
                 pages_processed INTEGER NOT NULL DEFAULT 0,
                 cards_found INTEGER NOT NULL DEFAULT 0,
                 new_cards INTEGER NOT NULL DEFAULT 0,
+                changed_cards INTEGER NOT NULL DEFAULT 0,
+                unchanged_cards INTEGER NOT NULL DEFAULT 0,
+                existing_cards INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                reported_total INTEGER,
+                stop_reason TEXT,
                 status TEXT NOT NULL,
                 error TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS card_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                sios_id INTEGER NOT NULL,
+                observed_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('NEW', 'CHANGED', 'UNCHANGED')),
+                content_hash TEXT NOT NULL,
+                changed_fields_json TEXT,
+                FOREIGN KEY (run_id) REFERENCES collection_runs(run_id),
+                FOREIGN KEY (sios_id) REFERENCES cards(sios_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_card_observations_sios_id
+                ON card_observations(sios_id);
+            CREATE INDEX IF NOT EXISTS idx_card_observations_run_id
+                ON card_observations(run_id);
             """
         )
+        self._migrate_collection_runs()
         self.conn.commit()
+
+    def _migrate_collection_runs(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(collection_runs)")
+        }
+        if "changed_cards" not in columns:
+            self.conn.execute(
+                "ALTER TABLE collection_runs ADD COLUMN changed_cards INTEGER NOT NULL DEFAULT 0"
+            )
+        if "unchanged_cards" not in columns:
+            self.conn.execute(
+                "ALTER TABLE collection_runs ADD COLUMN unchanged_cards INTEGER NOT NULL DEFAULT 0"
+            )
+        if "existing_cards" not in columns:
+            self.conn.execute(
+                "ALTER TABLE collection_runs ADD COLUMN existing_cards INTEGER NOT NULL DEFAULT 0"
+            )
+        if "error_count" not in columns:
+            self.conn.execute(
+                "ALTER TABLE collection_runs ADD COLUMN error_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "reported_total" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN reported_total INTEGER")
+        if "stop_reason" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN stop_reason TEXT")
 
     def start_run(self, keyword: Optional[str]) -> int:
         cur = self.conn.execute(
@@ -93,15 +214,37 @@ class Storage:
         new_cards: int,
         status: str,
         error: Optional[str] = None,
+        changed_cards: int = 0,
+        unchanged_cards: int = 0,
+        existing_cards: int = 0,
+        error_count: int = 0,
+        reported_total: Optional[int] = None,
+        stop_reason: Optional[str] = None,
     ) -> None:
         self.conn.execute(
             """
             UPDATE collection_runs
             SET finished_at = ?, pages_processed = ?, cards_found = ?,
-                new_cards = ?, status = ?, error = ?
+                new_cards = ?, changed_cards = ?, unchanged_cards = ?,
+                existing_cards = ?, error_count = ?, reported_total = ?,
+                stop_reason = ?, status = ?, error = ?
             WHERE run_id = ?
             """,
-            (utc_now(), pages_processed, cards_found, new_cards, status, error, run_id),
+            (
+                utc_now(),
+                pages_processed,
+                cards_found,
+                new_cards,
+                changed_cards,
+                unchanged_cards,
+                existing_cards,
+                error_count,
+                reported_total,
+                stop_reason,
+                status,
+                error,
+                run_id,
+            ),
         )
         self.conn.commit()
 
@@ -111,30 +254,17 @@ class Storage:
         ).fetchone()
         return row is not None
 
-    def upsert_card(self, record: CardRecord) -> UpsertResult:
+    def upsert_card(self, record: CardRecord, run_id: Optional[int] = None) -> UpsertResult:
         now = utc_now()
         existing = self.conn.execute(
-            "SELECT first_seen_at FROM cards WHERE sios_id = ?",
+            "SELECT * FROM cards WHERE sios_id = ?",
             (record.sios_id,),
         ).fetchone()
-        created = existing is None
-        first_seen = now if created else existing["first_seen_at"]
-        values = (
-            record.sios_id,
-            record.card_number,
-            record.year,
-            record.document_name,
-            record.document_type,
-            record.case_reference,
-            record.authority,
-            record.location,
-            json.dumps(record.dates, ensure_ascii=False),
-            record.source_url,
-            first_seen,
-            now,
-            json.dumps(record.raw_fields, ensure_ascii=False),
-        )
-        if created:
+        payload = content_payload_from_record(record)
+        digest = content_hash(payload)
+        changed_fields: Optional[dict[str, Any]] = None
+        if existing is None:
+            status = STATUS_NEW
             self.conn.execute(
                 """
                 INSERT INTO cards (
@@ -143,26 +273,8 @@ class Storage:
                     first_seen_at, last_seen_at, raw_fields_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                values,
-            )
-        else:
-            self.conn.execute(
-                """
-                UPDATE cards SET
-                    card_number = ?,
-                    year = ?,
-                    document_name = ?,
-                    document_type = ?,
-                    case_reference = ?,
-                    authority = ?,
-                    location = ?,
-                    dates_json = ?,
-                    source_url = ?,
-                    last_seen_at = ?,
-                    raw_fields_json = ?
-                WHERE sios_id = ?
-                """,
                 (
+                    record.sios_id,
                     record.card_number,
                     record.year,
                     record.document_name,
@@ -173,10 +285,51 @@ class Storage:
                     json.dumps(record.dates, ensure_ascii=False),
                     record.source_url,
                     now,
+                    now,
                     json.dumps(record.raw_fields, ensure_ascii=False),
-                    record.sios_id,
                 ),
             )
+        else:
+            changed_fields = diff_content(content_payload_from_row(existing), payload) or None
+            if changed_fields:
+                status = STATUS_CHANGED
+                self.conn.execute(
+                    """
+                    UPDATE cards SET
+                        card_number = ?,
+                        year = ?,
+                        document_name = ?,
+                        document_type = ?,
+                        case_reference = ?,
+                        authority = ?,
+                        location = ?,
+                        dates_json = ?,
+                        source_url = ?,
+                        last_seen_at = ?,
+                        raw_fields_json = ?
+                    WHERE sios_id = ?
+                    """,
+                    (
+                        record.card_number,
+                        record.year,
+                        record.document_name,
+                        record.document_type,
+                        record.case_reference,
+                        record.authority,
+                        record.location,
+                        json.dumps(record.dates, ensure_ascii=False),
+                        record.source_url,
+                        now,
+                        json.dumps(record.raw_fields, ensure_ascii=False),
+                        record.sios_id,
+                    ),
+                )
+            else:
+                status = STATUS_UNCHANGED
+                self.conn.execute(
+                    "UPDATE cards SET last_seen_at = ? WHERE sios_id = ?",
+                    (now, record.sios_id),
+                )
         for keyword in record.matched_keywords:
             self.conn.execute(
                 """
@@ -185,8 +338,32 @@ class Storage:
                 """,
                 (record.sios_id, keyword),
             )
+        if run_id is not None:
+            self.conn.execute(
+                """
+                INSERT INTO card_observations (
+                    run_id, sios_id, observed_at, status, content_hash, changed_fields_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    record.sios_id,
+                    now,
+                    status,
+                    digest,
+                    json.dumps(changed_fields, ensure_ascii=False, sort_keys=True)
+                    if changed_fields
+                    else None,
+                ),
+            )
         self.conn.commit()
-        return UpsertResult(created=created, sios_id=record.sios_id)
+        return UpsertResult(
+            created=status == STATUS_NEW,
+            sios_id=record.sios_id,
+            status=status,
+            content_hash=digest,
+            changed_fields=changed_fields,
+        )
 
     def add_keyword_match(self, sios_id: int, keyword: str) -> None:
         self.conn.execute(
@@ -197,6 +374,24 @@ class Storage:
             (sios_id, keyword),
         )
         self.conn.commit()
+
+    def observations_for(self, sios_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, run_id, sios_id, observed_at, status, content_hash, changed_fields_json
+            FROM card_observations
+            WHERE sios_id = ?
+            ORDER BY id
+            """,
+            (sios_id,),
+        ).fetchall()
+        observations: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw_changes = item.pop("changed_fields_json")
+            item["changed_fields"] = json.loads(raw_changes) if raw_changes else None
+            observations.append(item)
+        return observations
 
     def keywords_for(self, sios_id: int) -> list[str]:
         rows = self.conn.execute(
@@ -219,4 +414,16 @@ class Storage:
 
     def card_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM cards").fetchone()
+        return int(row["n"])
+
+    def count_distinct_cards(self, run_ids: list[int]) -> int:
+        if not run_ids:
+            return 0
+        placeholders = ",".join("?" for _ in run_ids)
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT sios_id) AS n FROM card_observations WHERE run_id IN ({})".format(
+                placeholders
+            ),
+            tuple(run_ids),
+        ).fetchone()
         return int(row["n"])

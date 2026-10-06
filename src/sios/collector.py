@@ -12,11 +12,53 @@ from .client import SiosClient, SiosHttpError
 from .config import CollectorSettings, flatten_keywords, load_keyword_groups, load_settings
 from .detail_parser import parse_detail_page
 from .logging_utils import configure_logging, log_extra
-from .models import CardRecord, PaginationDecision, SearchHit, pagination_decision
+from .models import PaginationDecision, SearchHit, pagination_decision
 from .search_parser import parse_search_page, parse_total_count
-from .storage import Storage
+from .storage import STATUS_CHANGED, STATUS_NEW, STATUS_UNCHANGED, Storage, UpsertResult
 
 logger = logging.getLogger(__name__)
+
+STOP_EMPTY_PAGE = "EMPTY_PAGE"
+STOP_REPEATED_PAGE = "REPEATED_PAGE"
+STOP_NO_NEW_IDS = "NO_NEW_IDS"
+STOP_MAX_PAGES = "MAX_PAGES"
+STOP_HTTP_ERROR = "HTTP_ERROR"
+STOP_COMPLETED = "COMPLETED"
+STOP_PARTIAL_DETAIL_FAILURE = "PARTIAL_DETAIL_FAILURE"
+
+_SEARCH_STOP_REASONS = {
+    "empty_page": STOP_EMPTY_PAGE,
+    "repeated_page": STOP_REPEATED_PAGE,
+    "no_new_ids": STOP_NO_NEW_IDS,
+    "max_pages": STOP_MAX_PAGES,
+    "http_error": STOP_HTTP_ERROR,
+}
+
+
+def apply_stop_reason(result: KeywordRunResult) -> None:
+    """Persist the stop the collector already chose.
+
+    Search stops, including HTTP_ERROR and MAX_PAGES, are kept. Detail-fetch
+    failures that happen without a search stop use PARTIAL_DETAIL_FAILURE.
+    A card fetch with no search uses COMPLETED.
+    """
+    mapped = _SEARCH_STOP_REASONS.get(result.termination_reason or "")
+    if mapped:
+        result.stop_reason = mapped
+    elif result.errors:
+        result.stop_reason = STOP_PARTIAL_DETAIL_FAILURE
+    else:
+        result.stop_reason = STOP_COMPLETED
+
+
+def _count_outcome(result: KeywordRunResult, status: str) -> None:
+    if status == STATUS_NEW:
+        result.new_cards += 1
+    elif status == STATUS_CHANGED:
+        result.changed_cards += 1
+    elif status == STATUS_UNCHANGED:
+        result.unchanged_cards += 1
+    result.existing_cards = result.changed_cards + result.unchanged_cards
 
 
 def keyword_slug(keyword: str) -> str:
@@ -37,10 +79,14 @@ class KeywordRunResult:
     pages_processed: int = 0
     unique_cards: int = 0
     new_cards: int = 0
+    changed_cards: int = 0
+    unchanged_cards: int = 0
     existing_cards: int = 0
     errors: int = 0
     termination_reason: Optional[str] = None
+    stop_reason: Optional[str] = None
     reported_total: Optional[int] = None
+    run_id: Optional[int] = None
     status: str = "ok"
 
 
@@ -118,13 +164,37 @@ class Collector:
         )
         return list(hits_by_id.values()), result
 
+    def _persist_run(
+        self,
+        run_id: int,
+        result: KeywordRunResult,
+        status: str,
+        error: Optional[str] = None,
+    ) -> None:
+        apply_stop_reason(result)
+        self.storage.finish_run(
+            run_id,
+            pages_processed=result.pages_processed,
+            cards_found=result.unique_cards,
+            new_cards=result.new_cards,
+            changed_cards=result.changed_cards,
+            unchanged_cards=result.unchanged_cards,
+            existing_cards=result.existing_cards,
+            error_count=result.errors,
+            reported_total=result.reported_total,
+            stop_reason=result.stop_reason,
+            status=status,
+            error=error,
+        )
+
     def fetch_card(
         self,
         sios_id: int,
         keywords: Optional[list[str]] = None,
         search_hit: Optional[SearchHit] = None,
-    ) -> Optional[CardRecord]:
-        """Fetch, parse, and store one card."""
+        run_id: Optional[int] = None,
+    ) -> Optional[UpsertResult]:
+        """Fetch, parse, and store one card. Returns the observation outcome."""
         url = self.client.card_url(sios_id)
         try:
             html = self.client.fetch_card(sios_id)
@@ -161,52 +231,36 @@ class Collector:
             record.case_reference = record.case_reference or search_hit.case_reference
             record.location = record.location or search_hit.location
         record.matched_keywords = list(keywords or [])
-        self.storage.upsert_card(record)
-        return record
+        return self.storage.upsert_card(record, run_id=run_id)
 
     def collect_keyword(self, keyword: str, max_pages: Optional[int] = None) -> KeywordRunResult:
         run_id = self.storage.start_run(keyword)
         logger.info("run_start", extra=log_extra(run_id=run_id, keyword=keyword))
         hits, result = self.search(keyword, max_pages=max_pages)
-        new_cards = 0
-        existing_cards = 0
+        result.run_id = run_id
         try:
             for hit in hits:
-                existed = self.storage.has_card(hit.sios_id)
-                stored = self.fetch_card(hit.sios_id, keywords=[keyword], search_hit=hit)
+                stored = self.fetch_card(
+                    hit.sios_id,
+                    keywords=[keyword],
+                    search_hit=hit,
+                    run_id=run_id,
+                )
                 if stored is None:
                     result.errors += 1
                     continue
-                if existed:
-                    existing_cards += 1
-                else:
-                    new_cards += 1
+                _count_outcome(result, stored.status)
             result.unique_cards = len(hits)
-            result.new_cards = new_cards
-            result.existing_cards = existing_cards
             status = "ok" if result.errors == 0 else "partial"
             if result.status == "error":
                 status = "error"
             result.status = status
-            self.storage.finish_run(
-                run_id,
-                pages_processed=result.pages_processed,
-                cards_found=result.unique_cards,
-                new_cards=result.new_cards,
-                status=status,
-            )
+            self._persist_run(run_id, result, status=status)
         except Exception as exc:
             result.status = "error"
             result.errors += 1
             logger.exception("collect_keyword_failed", extra=log_extra(keyword=keyword))
-            self.storage.finish_run(
-                run_id,
-                pages_processed=result.pages_processed,
-                cards_found=result.unique_cards,
-                new_cards=result.new_cards,
-                status="error",
-                error=str(exc),
-            )
+            self._persist_run(run_id, result, status="error", error=str(exc))
         logger.info(
             "run_end",
             extra=log_extra(
@@ -215,9 +269,12 @@ class Collector:
                 pages_processed=result.pages_processed,
                 unique_cards=result.unique_cards,
                 new_cards=result.new_cards,
+                changed_cards=result.changed_cards,
+                unchanged_cards=result.unchanged_cards,
                 existing_cards=result.existing_cards,
                 errors=result.errors,
                 termination_reason=result.termination_reason,
+                stop_reason=result.stop_reason,
                 status=result.status,
             ),
         )
@@ -225,32 +282,23 @@ class Collector:
 
     def collect_card_id(self, sios_id: int) -> KeywordRunResult:
         run_id = self.storage.start_run(keyword=None)
-        result = KeywordRunResult(keyword="(card-id)")
-        existed = self.storage.has_card(sios_id)
-        stored = self.fetch_card(sios_id, keywords=[])
+        result = KeywordRunResult(keyword="(card-id)", run_id=run_id)
+        stored = self.fetch_card(sios_id, keywords=[], run_id=run_id)
         result.pages_processed = 0
         if stored is None:
             result.errors = 1
             result.status = "error"
-            self.storage.finish_run(
+            self._persist_run(
                 run_id,
-                pages_processed=0,
-                cards_found=0,
-                new_cards=0,
+                result,
                 status="error",
                 error=f"failed to fetch card {sios_id}",
             )
         else:
             result.unique_cards = 1
-            result.new_cards = 0 if existed else 1
-            result.existing_cards = 1 if existed else 0
-            self.storage.finish_run(
-                run_id,
-                pages_processed=0,
-                cards_found=1,
-                new_cards=result.new_cards,
-                status="ok",
-            )
+            _count_outcome(result, stored.status)
+            result.status = "ok"
+            self._persist_run(run_id, result, status="ok")
         return result
 
 
@@ -259,10 +307,12 @@ def print_summary(result: KeywordRunResult) -> None:
     print(f"Pages processed: {result.pages_processed}")
     print(f"Unique cards found: {result.unique_cards}")
     print(f"New cards: {result.new_cards}")
+    print(f"Changed cards: {result.changed_cards}")
+    print(f"Unchanged cards: {result.unchanged_cards}")
     print(f"Existing cards: {result.existing_cards}")
     print(f"Errors: {result.errors}")
-    if result.termination_reason:
-        print(f"Pagination stop: {result.termination_reason}")
+    if result.stop_reason:
+        print(f"Stop reason: {result.stop_reason}")
     if result.reported_total is not None:
         print(f"SIOS reported total: {result.reported_total}")
 
@@ -290,6 +340,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def combine_keyword_runs(parts: list[KeywordRunResult], unique_cards: int) -> KeywordRunResult:
+    """Sum run counters. unique_cards is the distinct total, not a sum of parts."""
+    totals = KeywordRunResult(keyword="(all)")
+    for part in parts:
+        totals.pages_processed += part.pages_processed
+        totals.new_cards += part.new_cards
+        totals.changed_cards += part.changed_cards
+        totals.unchanged_cards += part.unchanged_cards
+        totals.existing_cards += part.existing_cards
+        totals.errors += part.errors
+        if part.status != "ok":
+            totals.status = "partial"
+    totals.unique_cards = unique_cards
+    return totals
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level)
@@ -312,24 +378,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     collector = Collector(settings, storage, client)
     try:
         if args.card_id is not None:
-            print_summary(collector.collect_card_id(args.card_id))
-            return 0
+            result = collector.collect_card_id(args.card_id)
+            print_summary(result)
+            return 1 if result.status == "error" else 0
         if args.keyword:
-            print_summary(collector.collect_keyword(args.keyword, max_pages=args.max_pages))
-            return 0
+            result = collector.collect_keyword(args.keyword, max_pages=args.max_pages)
+            print_summary(result)
+            return 1 if result.status == "error" else 0
         keywords = flatten_keywords(load_keyword_groups(args.keywords_file))
-        totals = KeywordRunResult(keyword="(all)")
+        parts = []
         for keyword in keywords:
             part = collector.collect_keyword(keyword, max_pages=args.max_pages)
             print_summary(part)
             print("---")
-            totals.pages_processed += part.pages_processed
-            totals.unique_cards += part.unique_cards
-            totals.new_cards += part.new_cards
-            totals.existing_cards += part.existing_cards
-            totals.errors += part.errors
-            if part.status != "ok":
-                totals.status = "partial"
+            parts.append(part)
+        run_ids = [part.run_id for part in parts if part.run_id is not None]
+        totals = combine_keyword_runs(parts, storage.count_distinct_cards(run_ids))
         print("Combined")
         print_summary(totals)
         return 0 if totals.errors == 0 else 1
