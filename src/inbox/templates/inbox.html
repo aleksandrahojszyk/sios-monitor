@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monitoring Inbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='inbox.css') }}">
+</head>
+<body>
+  {% if usability_mode %}
+  <div class="usability-banner" role="status">
+    Usability test · participant {{ participant_id }} · isolated dataset
+    <form method="post" action="{{ url_for('finish_usability_session') }}">
+      <button type="submit">End session</button>
+    </form>
+  </div>
+  {% endif %}
+  <a class="skip-link" href="#results">Skip to results</a>
+  <header class="topbar">
+    <div class="brand">
+      <p class="eyebrow">Nasz Bóbr</p>
+      <h1>Monitoring Inbox</h1>
+      <p class="lede">Triage collected SIOS and EkoKarty cards. A card is not a case.</p>
+    </div>
+    <p class="new-count" aria-live="polite">
+      <span class="new-count__number">{{ metrics.total_new }}</span>
+      <span class="new-count__label">new</span>
+    </p>
+  </header>
+
+  <section class="metrics" aria-label="Operational metrics">
+    <a class="metric" href="?status=NEW">
+      <span class="metric__value">{{ metrics.total_new }}</span>
+      <span class="metric__label">New</span>
+    </a>
+    <div class="metric">
+      <span class="metric__value">{{ metrics.reviewed_today }}</span>
+      <span class="metric__label">Reviewed today</span>
+    </div>
+    <a class="metric" href="?status=REQUEST_DOCUMENTS">
+      <span class="metric__value">{{ metrics.request_documents }}</span>
+      <span class="metric__label">Request documents</span>
+    </a>
+    <a class="metric" href="?status=MONITOR">
+      <span class="metric__value">{{ metrics.monitor }}</span>
+      <span class="metric__label">Monitor</span>
+    </a>
+  </section>
+
+  <form class="filters" method="get" action="{{ url_for('inbox') }}">
+    <div class="filters__row">
+      <label>
+        Status
+        <select name="status">
+          <option value="NEW" {% if query.status == 'NEW' %}selected{% endif %}>New</option>
+          <option value="all" {% if query.status is none %}selected{% endif %}>All statuses</option>
+          {% for key, label in review_labels.items() %}
+            {% if key != 'NEW' %}
+            <option value="{{ key }}" {% if query.status == key %}selected{% endif %}>{{ label }}</option>
+            {% endif %}
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Source
+        <select name="source">
+          <option value="">All sources</option>
+          {% for source in facets.sources %}
+          <option value="{{ source }}" {% if query.source == source %}selected{% endif %}>{{ source_labels.get(source, source) }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Authority
+        <select name="authority">
+          <option value="">All authorities</option>
+          {% for item in facets.authorities %}
+          <option value="{{ item }}" {% if query.authority == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Document type
+        <select name="document_type">
+          <option value="">All types</option>
+          {% for item in facets.document_types %}
+          <option value="{{ item }}" {% if query.document_type == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Keyword
+        <select name="keyword">
+          <option value="">All keywords</option>
+          {% for item in facets.keywords %}
+          <option value="{{ item }}" {% if query.keyword == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Voivodeship
+        <select name="voivodeship">
+          <option value="">All (SIOS)</option>
+          {% for item in facets.voivodeships %}
+          <option value="{{ item }}" {% if query.voivodeship == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        County
+        <select name="county">
+          <option value="">All (SIOS)</option>
+          {% for item in facets.counties %}
+          <option value="{{ item }}" {% if query.county == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Date from
+        <input type="date" name="date_from" value="{{ query.date_from or '' }}">
+      </label>
+      <label>
+        Date to
+        <input type="date" name="date_to" value="{{ query.date_to or '' }}">
+      </label>
+      <label class="filters__search">
+        Search
+        <input type="search" name="q" value="{{ query.q or '' }}" placeholder="Card number, case, title, authority, location">
+      </label>
+      <button type="submit">Apply</button>
+    </div>
+    <p class="filters__hint">Date filter uses SIOS <code>entered_at</code> and EkoKarty <code>listing_date</code>. Geography filters apply to SIOS structured location only.</p>
+  </form>
+
+  <main id="results" class="results" tabindex="-1">
+    <p class="results__meta">
+      {{ page.total }} record{% if page.total != 1 %}s{% endif %}
+      · page {{ page.page }} of {{ page.total_pages }}
+      · sorted newest source date first
+    </p>
+
+    {% if empty_kind %}
+      <p class="empty" role="status">
+        {% if empty_kind == 'none' %}
+          No collected cards in the local database yet.
+        {% elif empty_kind == 'new' %}
+          No new cards to review.
+        {% elif empty_kind == 'search' %}
+          No records match this search.
+        {% else %}
+          No records match the selected filters.
+        {% endif %}
+      </p>
+    {% else %}
+      <ol class="queue">
+        {% for card in page.items %}
+        <li>
+          <article class="row" data-key="{{ card.external_key }}">
+            <a class="row__main" href="{{ url_for('card_detail', source_system=card.source_system, native_record_id=card.native_record_id) }}?{{ filter_qs(query) }}" data-drawer-url="{{ url_for('card_fragment', source_system=card.source_system, native_record_id=card.native_record_id) }}">
+              <div class="row__top">
+                <span class="badge badge--{{ card.source_system }}">{{ card.source_label }}</span>
+                <span class="row__number">{{ card.card_number or '—' }}</span>
+                <span class="row__date" title="{{ card.display_date_field }}">
+                  {{ card.display_date or 'Date unavailable' }}
+                  <span class="muted">{{ card.display_date_field }}</span>
+                </span>
+                <span class="status status--{{ card.review_status }}">{{ card.review_label }}</span>
+              </div>
+              <p class="row__title">{{ card.document_name or 'Untitled card' }}</p>
+              <p class="row__meta">
+                <span>{{ card.authority or 'Authority unavailable' }}</span>
+                <span>{{ card.document_type or 'Type unavailable' }}</span>
+                {% if card.location %}
+                <span>{{ card.location }}</span>
+                {% else %}
+                <span class="muted">Location unavailable</span>
+                {% endif %}
+              </p>
+              <p class="row__flags">
+                {% if card.matched_keywords %}
+                <span>Keywords: {{ card.matched_keywords | join(', ') }}</span>
+                {% endif %}
+                {% if card.case_reference %}
+                <span>Case {{ card.case_reference }}</span>
+                {% endif %}
+                {% if card.related_cards_count %}
+                <span>{{ card.related_cards_count }} related</span>
+                {% endif %}
+                {% if card.has_attachment %}
+                <span>Attachment listed</span>
+                {% endif %}
+              </p>
+            </a>
+            <div class="row__actions">
+              {% for action in quick_actions %}
+              <form method="post" action="{{ url_for('card_status', source_system=card.source_system, native_record_id=card.native_record_id) }}">
+                <input type="hidden" name="status" value="{{ action }}">
+                <input type="hidden" name="next" value="{{ url_for('inbox') }}?{{ filter_qs(query) }}">
+                <button type="submit" class="action action--{{ action }}" {% if card.review_status == action %}aria-current="true"{% endif %}>
+                  {{ review_labels[action] }}
+                </button>
+              </form>
+              {% endfor %}
+            </div>
+          </article>
+        </li>
+        {% endfor %}
+      </ol>
+    {% endif %}
+
+    {% if page.total_pages > 1 %}
+    <nav class="pager" aria-label="Pagination">
+      {% if page.page > 1 %}
+      <a href="?{{ filter_qs(query, page=page.page - 1) }}">Previous</a>
+      {% else %}
+      <span class="muted">Previous</span>
+      {% endif %}
+      <span>Page {{ page.page }} / {{ page.total_pages }}</span>
+      {% if page.page < page.total_pages %}
+      <a href="?{{ filter_qs(query, page=page.page + 1) }}">Next</a>
+      {% else %}
+      <span class="muted">Next</span>
+      {% endif %}
+    </nav>
+    {% endif %}
+  </main>
+
+  <aside id="drawer" class="drawer" hidden>
+    <div class="drawer__panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <button type="button" class="drawer__close" data-close-drawer>Close</button>
+      <div id="drawer-body"></div>
+    </div>
+  </aside>
+  <script src="{{ url_for('static', filename='inbox.js') }}"></script>
+</body>
+</html>

@@ -62,6 +62,29 @@ def test_multiple_keyword_matches(tmp_path: Path) -> None:
     assert storage.keywords_for(1) == ["bobry", "bóbr"]
 
 
+def test_same_sios_record_keeps_multiple_source_relationships(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "sios.sqlite")
+    original = sample_card(449913, "bóbr")
+    original.authority = "Starostwo Powiatowe w Kłodzku"
+
+    first = storage.upsert_card(original, source_key="dolnoslaskie")
+    rediscovered = sample_card(449913, "Castor fiber")
+    rediscovered.authority = "Starostwo Powiatowe w Kłodzku"
+    second = storage.upsert_card(rediscovered, source_key="opolskie")
+
+    assert first.status == STATUS_NEW
+    assert second.status == STATUS_UNCHANGED
+    assert storage.card_count() == 1
+    stored = storage.get_card(449913)
+    assert stored["source_system"] == "sios"
+    assert stored["native_record_id"] == "449913"
+    assert stored["source_keys"] == ["dolnoslaskie", "opolskie"]
+    # The source relation does not override or derive the publisher.
+    assert stored["authority"] == "Starostwo Powiatowe w Kłodzku"
+
+
 def _clock(monkeypatch: pytest.MonkeyPatch, stamps: list[str]) -> None:
     pending = iter(stamps)
 
@@ -316,6 +339,46 @@ def test_failed_or_incomplete_run_does_not_advance_watermark(
     assert storage.last_successful_window_end("Castor fiber") is None
 
 
+def test_watermark_is_scoped_by_source_and_keyword(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "sios.sqlite")
+    dolnoslaskie = storage.start_run(
+        "bóbr",
+        source_key="dolnoslaskie",
+        window_start="2026-08-01",
+        window_end="2026-10-01",
+        window_mode="EXPLICIT",
+    )
+    storage.finish_run(
+        dolnoslaskie,
+        pages_processed=1,
+        cards_found=0,
+        new_cards=0,
+        status="ok",
+        stop_reason="WINDOW_PASSED",
+    )
+    nationwide = storage.start_run(
+        "bóbr",
+        window_start="2026-08-01",
+        window_end="2026-10-05",
+        window_mode="EXPLICIT",
+    )
+    storage.finish_run(
+        nationwide,
+        pages_processed=1,
+        cards_found=0,
+        new_cards=0,
+        status="ok",
+        stop_reason="WINDOW_PASSED",
+    )
+
+    assert (
+        storage.last_successful_window_end("bóbr", "dolnoslaskie")
+        == "2026-10-01"
+    )
+    assert storage.last_successful_window_end("bóbr", "pomorskie") is None
+    assert storage.last_successful_window_end("bóbr") == "2026-10-05"
+
+
 def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite"
     conn = sqlite3.connect(str(path))
@@ -358,6 +421,8 @@ def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
     assert "cards_skipped_too_new" in columns
     assert "known_cards_skipped" in columns
     assert "detail_pages_fetched" in columns
+    assert "source_key" in columns
+    assert "window_splits" in columns
     tables = {
         row["name"]
         for row in storage.conn.execute(
@@ -374,5 +439,50 @@ def test_existing_database_gains_observation_columns(tmp_path: Path) -> None:
         for row in storage.conn.execute("PRAGMA table_info(card_observations)")
     }
     assert "parser_version" in card_columns
+    assert "source_system" in card_columns
+    assert "native_record_id" in card_columns
     assert "parser_version" in observation_columns
     assert "change_origin" in observation_columns
+    assert "record_sources" in tables
+
+
+def test_existing_sios_cards_gain_namespaced_identity(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-cards.sqlite"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE cards (
+            sios_id INTEGER PRIMARY KEY,
+            card_number TEXT,
+            year INTEGER,
+            document_name TEXT,
+            document_type TEXT,
+            case_reference TEXT,
+            authority TEXT,
+            location TEXT,
+            dates_json TEXT NOT NULL DEFAULT '{}',
+            source_url TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            raw_fields_json TEXT NOT NULL DEFAULT '{}',
+            parser_version TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO cards (
+            sios_id, source_url, first_seen_at, last_seen_at, parser_version
+        ) VALUES (449913, 'https://system.sios.pl/documents/details/id/449913',
+                  '2026-10-01', '2026-10-06', '2')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    card = storage.get_card(449913)
+
+    assert card["source_system"] == "sios"
+    assert card["native_record_id"] == "449913"
+    assert card["source_keys"] == []

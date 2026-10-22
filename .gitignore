@@ -9,4 +9,7 @@ data/raw/search/*.html
 data/raw/details/*.html
 data/normalized/*.sqlite
 data/normalized/*.sqlite-journal
+data/usability/*.sqlite
+data/usability/*.sqlite-journal
+data/usability/*.csv
 .DS_Store

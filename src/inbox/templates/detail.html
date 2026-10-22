@@ -1,0 +1,121 @@
+{% if not fragment %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ card.card_number or card.external_key }} · Monitoring Inbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='inbox.css') }}">
+</head>
+<body class="detail-page">
+  {% if usability_mode %}
+  <div class="usability-banner" role="status">
+    Usability test · participant {{ participant_id }} · isolated dataset
+    <form method="post" action="{{ url_for('finish_usability_session') }}">
+      <button type="submit">End session</button>
+    </form>
+  </div>
+  {% endif %}
+  <p><a href="{{ url_for('inbox') }}?{{ filter_qs(query) }}">Back to inbox</a></p>
+{% endif %}
+
+<article class="detail">
+  <header>
+    <p class="eyebrow">{{ card.source_label }} · {{ card.external_key }}</p>
+    <h2 id="drawer-title">{{ card.document_name or card.card_number or 'Untitled card' }}</h2>
+    <p class="status status--{{ card.review_status }}">{{ card.review_label }}</p>
+  </header>
+
+  <section>
+    <h3>Source metadata</h3>
+    <dl class="kv">
+      <div><dt>Card number</dt><dd>{{ card.card_number or 'Unavailable' }}</dd></div>
+      <div><dt>Source</dt><dd>{{ card.source_label }}</dd></div>
+      <div><dt>Authority</dt><dd>{{ card.authority or 'Unavailable' }}</dd></div>
+      <div><dt>Document type</dt><dd>{{ card.document_type or 'Unavailable' }}</dd></div>
+      <div><dt>Document name</dt><dd>{{ card.document_name or 'Unavailable' }}</dd></div>
+      <div><dt>Case reference</dt><dd>{{ card.case_reference or 'Unavailable' }}</dd></div>
+      <div><dt>Source date</dt><dd>{{ card.display_date or 'Unavailable' }} <span class="muted">({{ card.display_date_field }})</span></dd></div>
+      {% for key, value in card.dates.items() %}
+      <div><dt>{{ key }}</dt><dd>{{ value or 'Unavailable' }}</dd></div>
+      {% endfor %}
+      <div><dt>Location</dt><dd>{{ card.location or 'Unavailable' }}</dd></div>
+      <div><dt>Voivodeship</dt><dd>{{ card.voivodeship or 'Unavailable' }}</dd></div>
+      <div><dt>County</dt><dd>{{ card.county or 'Unavailable' }}</dd></div>
+      <div><dt>Municipality</dt><dd>{{ card.municipality or 'Unavailable' }}</dd></div>
+      <div><dt>Keywords</dt><dd>{{ card.matched_keywords | join(', ') or 'None' }}</dd></div>
+    </dl>
+  </section>
+
+  {% if card.related_cards %}
+  <section>
+    <h3>Related cards</h3>
+    <ul>
+      {% for related in card.related_cards %}
+      <li>{{ related.card_number or related.card_id or related.sios_id }}</li>
+      {% endfor %}
+    </ul>
+    <p class="muted">Related-card links are a signal, not a case record.</p>
+  </section>
+  {% endif %}
+
+  {% if card.attachments %}
+  <section>
+    <h3>Attachments (metadata only)</h3>
+    <ul>
+      {% for item in card.attachments %}
+      <li>{{ item.filename or item.url }}</li>
+      {% endfor %}
+    </ul>
+    <p class="muted">Files are not downloaded by this inbox.</p>
+  </section>
+  {% endif %}
+
+  {% set raw_items = useful_raw(card.raw_fields) %}
+  {% if raw_items %}
+  <section>
+    <h3>Other published fields</h3>
+    <dl class="kv">
+      {% for key, value in raw_items %}
+      <div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>
+      {% endfor %}
+    </dl>
+  </section>
+  {% endif %}
+
+  <section>
+    <h3>Review</h3>
+    <p>Human decision, stored separately from scraped metadata. Card ≠ Case.</p>
+    <div class="row__actions">
+      {% for action in review_statuses %}
+      <form method="post" action="{{ url_for('card_status', source_system=card.source_system, native_record_id=card.native_record_id) }}">
+        <input type="hidden" name="status" value="{{ action }}">
+        <input type="hidden" name="next" value="{% if fragment %}{{ url_for('inbox') }}?{{ filter_qs(query) }}{% else %}{{ url_for('card_detail', source_system=card.source_system, native_record_id=card.native_record_id) }}{% endif %}">
+        <button type="submit" class="action action--{{ action }}" {% if card.review_status == action %}aria-current="true"{% endif %}>
+          {{ review_labels[action] }}
+        </button>
+      </form>
+      {% endfor %}
+    </div>
+    <form method="post" action="{{ url_for('card_note', source_system=card.source_system, native_record_id=card.native_record_id) }}" class="note-form">
+      <label for="note-{{ card.external_key }}">Note</label>
+      <textarea id="note-{{ card.external_key }}" name="note" rows="4" placeholder="Duża liczba bobrów, sprawdzić dokumentację.">{{ card.review_note or '' }}</textarea>
+      <input type="hidden" name="next" value="{% if fragment %}{{ url_for('inbox') }}?{{ filter_qs(query) }}{% else %}{{ url_for('card_detail', source_system=card.source_system, native_record_id=card.native_record_id) }}{% endif %}">
+      <button type="submit">Save note</button>
+    </form>
+    <p class="muted">Reviewed at: {{ card.reviewed_at or 'Not yet reviewed' }}</p>
+  </section>
+
+  <p class="source-action">
+    {% if card.source_url %}
+    <a class="button-link" href="{{ url_for('open_source', source_system=card.source_system, native_record_id=card.native_record_id) }}" target="_blank" rel="noopener noreferrer">Open original card</a>
+    {% else %}
+    <span class="button-link button-link--disabled">Open original card unavailable</span>
+    {% endif %}
+  </p>
+</article>
+
+{% if not fragment %}
+</body>
+</html>
+{% endif %}

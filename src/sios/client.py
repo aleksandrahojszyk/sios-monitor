@@ -33,12 +33,14 @@ class SiosClient:
         iid: int = 0,
         results_per_page: int = 30,
         transport: Optional[httpx.BaseTransport] = None,
+        search_params: Optional[dict[str, Any]] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.request_delay_seconds = request_delay_seconds
         self.max_retries = max_retries
         self.iid = iid
         self.results_per_page = results_per_page
+        self.search_params = dict(search_params or {})
         self._last_request_at: Optional[float] = None
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -139,6 +141,7 @@ class SiosClient:
             "results": results if results is not None else self.results_per_page,
             "submitSearch": "Szukaj",
         }
+        params.update(self.search_params)
         return self.get(SEARCH_PATH, params=params)
 
     def fetch_card(self, sios_id: int) -> str:

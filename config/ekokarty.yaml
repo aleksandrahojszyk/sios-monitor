@@ -1,0 +1,15 @@
+# Operational settings for the bounded public EkoKarty adapter.
+# Search is institution-scoped POST HTML. Do not treat 2000 rows as complete.
+
+base_url: "https://ekokarty.pl"
+user_agent: "sios-monitor/0.1 (public EkoKarty metadata collector; conservative pacing)"
+timeout_seconds: 30
+request_delay_seconds: 1.5
+max_retries: 4
+save_raw_html: true
+sqlite_path: "data/normalized/sios.sqlite"
+raw_search_dir: "data/raw/ekokarty/search"
+raw_details_dir: "data/raw/ekokarty/details"
+result_cap: 2000
+max_requests: 1000
+default_since: "2010-01-01"

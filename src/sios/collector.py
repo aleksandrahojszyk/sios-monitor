@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Optional
 
 from .client import SiosClient, SiosHttpError
-from .config import CollectorSettings, flatten_keywords, load_keyword_groups, load_settings
+from .config import (
+    CollectorSettings,
+    SourceConfig,
+    flatten_keywords,
+    load_keyword_groups,
+    load_settings,
+    load_sources,
+)
 from .detail_parser import parse_detail_page
 from .logging_utils import configure_logging, log_extra
 from .models import CardRecord, PaginationDecision, SearchHit, pagination_decision
@@ -109,6 +116,7 @@ def write_raw(path: Path, html: str) -> None:
 @dataclass
 class KeywordRunResult:
     keyword: str
+    source_key: Optional[str] = None
     pages_processed: int = 0
     unique_cards: int = 0
     new_cards: int = 0
@@ -135,17 +143,28 @@ class KeywordRunResult:
 
 
 class Collector:
-    def __init__(self, settings: CollectorSettings, storage: Storage, client: SiosClient) -> None:
+    def __init__(
+        self,
+        settings: CollectorSettings,
+        storage: Storage,
+        client: SiosClient,
+        source: Optional[SourceConfig] = None,
+    ) -> None:
         self.settings = settings
         self.storage = storage
         self.client = client
+        self.source = source
+
+    @property
+    def source_key(self) -> Optional[str]:
+        return self.source.key if self.source is not None else None
 
     def search(self, keyword: str, max_pages: Optional[int] = None) -> tuple[list[SearchHit], KeywordRunResult]:
         limit = max_pages if max_pages is not None else self.settings.max_pages
         hits_by_id: dict[int, SearchHit] = {}
         seen_ids: set[int] = set()
         previous_ids: Optional[set[int]] = None
-        result = KeywordRunResult(keyword=keyword)
+        result = KeywordRunResult(keyword=keyword, source_key=self.source_key)
         page = 1
         while page <= limit:
             try:
@@ -161,7 +180,8 @@ class Collector:
                 break
 
             if self.settings.save_raw_html:
-                filename = f"search_{keyword_slug(keyword)}_page_{page}.html"
+                prefix = f"{self.source_key}_" if self.source_key else ""
+                filename = f"search_{prefix}{keyword_slug(keyword)}_page_{page}.html"
                 write_raw(self.settings.raw_search_dir / filename, html)
 
             if page == 1:
@@ -233,6 +253,7 @@ class Collector:
             cards_skipped_too_new=result.cards_skipped_too_new,
             known_cards_skipped=result.known_cards_skipped,
             detail_pages_fetched=result.detail_pages_fetched,
+            window_splits=getattr(result, "window_splits", 0),
             status=status,
             error=error,
         )
@@ -292,10 +313,14 @@ class Collector:
         if record is None:
             return None
         record.matched_keywords = list(keywords or [])
-        return self.storage.upsert_card(record, run_id=run_id)
+        return self.storage.upsert_card(
+            record,
+            run_id=run_id,
+            source_key=self.source_key,
+        )
 
     def collect_keyword(self, keyword: str, max_pages: Optional[int] = None) -> KeywordRunResult:
-        run_id = self.storage.start_run(keyword)
+        run_id = self.storage.start_run(keyword, source_key=self.source_key)
         logger.info("run_start", extra=log_extra(run_id=run_id, keyword=keyword))
         hits, result = self.search(keyword, max_pages=max_pages)
         result.run_id = run_id
@@ -369,9 +394,11 @@ class Collector:
             window_mode=window_mode,
             watermark_used=watermark_used,
             overlap_days=overlap_days,
+            source_key=self.source_key,
         )
         result = KeywordRunResult(
             keyword=keyword,
+            source_key=self.source_key,
             run_id=run_id,
             window_start=since.isoformat(),
             window_end=until.isoformat(),
@@ -416,7 +443,8 @@ class Collector:
                     break
 
                 if self.settings.save_raw_html:
-                    filename = f"search_{keyword_slug(keyword)}_page_{page}.html"
+                    prefix = f"{self.source_key}_" if self.source_key else ""
+                    filename = f"search_{prefix}{keyword_slug(keyword)}_page_{page}.html"
                     write_raw(self.settings.raw_search_dir / filename, html)
                 if page == 1:
                     result.reported_total = parse_total_count(html)
@@ -442,6 +470,10 @@ class Collector:
                     entered_at = None
 
                     if existing is not None:
+                        if self.source_key is not None:
+                            self.storage.link_sios_record_source(
+                                hit.sios_id, self.source_key
+                            )
                         entered_at = parse_source_datetime(
                             existing["dates"].get("entered_at")
                         )
@@ -501,7 +533,9 @@ class Collector:
                         else:
                             record.matched_keywords = [keyword]
                             stored = self.storage.upsert_card(
-                                record, run_id=run_id
+                                record,
+                                run_id=run_id,
+                                source_key=self.source_key,
                             )
                             _count_outcome(result, stored.status)
 
@@ -509,7 +543,10 @@ class Collector:
                         since <= source_date <= until
                     ):
                         record.matched_keywords = [keyword]
-                        self.storage.upsert_card(record)
+                        self.storage.upsert_card(
+                            record,
+                            source_key=self.source_key,
+                        )
 
                 seen_ids.update(decision.new_ids)
                 previous_ids = set(dict.fromkeys(page_ids))
@@ -583,11 +620,15 @@ class Collector:
         max_pages: Optional[int] = None,
     ) -> KeywordRunResult:
         """Run from the last safe bounded watermark with a one-day overlap."""
-        watermark = self.storage.last_successful_window_end(keyword)
+        watermark = self.storage.last_successful_window_end(
+            keyword, source_key=self.source_key
+        )
         if watermark is None:
             raise NoWatermarkError(
-                "No successful bounded run exists for {!r}; provide --since".format(
-                    keyword
+                "No successful bounded run exists for keyword {!r} and source "
+                "{!r}; provide --since".format(
+                    keyword,
+                    self.source_key or "(nationwide/manual)",
                 )
             )
         try:
@@ -609,8 +650,10 @@ class Collector:
         )
 
     def collect_card_id(self, sios_id: int) -> KeywordRunResult:
-        run_id = self.storage.start_run(keyword=None)
-        result = KeywordRunResult(keyword="(card-id)", run_id=run_id)
+        run_id = self.storage.start_run(keyword=None, source_key=self.source_key)
+        result = KeywordRunResult(
+            keyword="(card-id)", run_id=run_id, source_key=self.source_key
+        )
         stored = self.fetch_card(sios_id, keywords=[], run_id=run_id)
         result.pages_processed = 0
         if stored is None:
@@ -632,6 +675,8 @@ class Collector:
 
 def print_summary(result: KeywordRunResult) -> None:
     print(f"Keyword: {result.keyword}")
+    if result.source_key is not None:
+        print(f"Source: {result.source_key}")
     print(f"Pages processed: {result.pages_processed}")
     print(f"Unique cards found: {result.unique_cards}")
     print(f"New cards: {result.new_cards}")
@@ -659,14 +704,26 @@ def print_summary(result: KeywordRunResult) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect public SIOS card metadata.")
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--keyword", help="Run one public search keyword.")
-    source.add_argument(
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument("--keyword", help="Run one public search keyword.")
+    operation.add_argument(
         "--all-keywords",
         action="store_true",
         help="Run every keyword from config/keywords.yaml.",
     )
-    source.add_argument("--card-id", type=int, help="Fetch a single public card by numeric SIOS ID.")
+    operation.add_argument(
+        "--card-id", type=int, help="Fetch a single public card by numeric SIOS ID."
+    )
+    parser.add_argument(
+        "--source",
+        help="Source key from config/sources.yaml (for example dolnoslaskie).",
+    )
+    parser.add_argument(
+        "--sources-file",
+        type=Path,
+        default=None,
+        help="Path to sources.yaml.",
+    )
     parser.add_argument("--max-pages", type=int, default=None, help="Safety cap on search pages.")
     parser.add_argument(
         "--since",
@@ -722,6 +779,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--until requires --since")
     if (args.since is not None or args.incremental) and not args.keyword:
         parser.error("--since/--until/--incremental currently require --keyword")
+    if args.source is not None and not args.keyword:
+        parser.error("--source currently requires --keyword")
     if (
         args.since is not None
         and args.until is not None
@@ -730,6 +789,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--until must be on or after --since")
     configure_logging(args.log_level)
     settings = load_settings(args.config)
+    selected_source: Optional[SourceConfig] = None
+    if args.source is not None:
+        sources = load_sources(args.sources_file)
+        selected_source = sources.get(args.source)
+        if selected_source is None:
+            parser.error("Unknown source key: {}".format(args.source))
+        if not selected_source.enabled:
+            parser.error("Source is disabled: {}".format(args.source))
     if args.delay is not None:
         settings.request_delay_seconds = args.delay
     if args.no_raw:
@@ -744,8 +811,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_retries=settings.max_retries,
         iid=settings.iid,
         results_per_page=settings.results_per_page,
+        search_params=selected_source.params if selected_source else None,
     )
-    collector = Collector(settings, storage, client)
+    collector = Collector(settings, storage, client, source=selected_source)
     try:
         if args.card_id is not None:
             result = collector.collect_card_id(args.card_id)

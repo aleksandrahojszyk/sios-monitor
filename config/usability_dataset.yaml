@@ -1,0 +1,67 @@
+# Isolated Monitoring Inbox usability-test dataset.
+# SIOS rows are copied from the local collector database with identity unchanged.
+# EkoKarty rows are synthetic fixtures (no bounded Warszawa collect was available).
+# Synthetic cards are marked in raw_fields._usability_fixture and are not shown in the UI.
+
+sios_native_record_ids:
+  # Clearly beaver-related decisions / applications
+  - "438450"  # decyzja, tamy, Czchów, case_reference
+  - "438599"  # decyzja, tamy
+  - "438897"  # decyzja, 1 tama
+  - "440414"  # decyzja, tama, attachments, related
+  - "440422"  # decyzja, tamy, missing municipality, attachments
+  - "441133"  # wniosek odstrzał, missing municipality
+  - "439226"  # decyzja art. 56, attachments, related
+  - "438476"  # wniosek, related
+  - "450138"  # decyzja, related
+  # Related pair that shares a case_reference (both cards in this set)
+  - "439274"  # wniosek, related to 439276
+  - "439276"  # decyzja, related to 439274
+  # Related metadata / short titles
+  - "438649"  # decyzja titled only "Decyzja", related
+  - "449913"  # decyzja, related
+  # Attachment metadata; weaker or non-beaver titles (possible IGNORE)
+  - "440202"  # ogród botaniczny/zoologiczny, attachment
+  - "447386"  # obwieszczenie, attachment
+  - "439230"  # decyzja art. 56, attachment, related
+  # Missing geography
+  - "439543"  # missing county and municipality
+  - "441360"  # missing county and municipality
+  - "439029"  # missing municipality
+  # Other document types / less obvious titles
+  - "438771"  # zgłoszenie
+  - "443337"  # postanowienie, Bobrowice (name coincidence)
+  - "443339"  # opinia, inne dokumenty
+  - "445104"  # zgłoszenie art. 118
+  - "449792"  # inne wnioski, ustna zgoda
+
+# Moderator-only mix notes. Not shown in the Inbox UI.
+mix:
+  sources:
+    sios: copied from local collector SQLite
+    ekokarty: synthetic fixtures marked _usability_fixture
+  expected_traits:
+    case_reference: most SIOS rows plus EkoKarty research pair
+    missing_municipality:
+      - "439029"
+      - "440422"
+      - "441133"
+    missing_county:
+      - "439543"
+      - "441360"
+    related_cards_in_set:
+      - ["439274", "439276"]
+    attachment_metadata:
+      - "439226"
+      - "439230"
+      - "440202"
+      - "440414"
+      - "440422"
+      - "447386"
+    document_types:
+      - decyzje
+      - wnioski o wydanie decyzji
+      - zgłoszenia
+      - postanowienia
+      - inne dokumenty
+      - inne wnioski

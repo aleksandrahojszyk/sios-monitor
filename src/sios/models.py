@@ -4,11 +4,18 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+SOURCE_SYSTEM_SIOS = "sios"
+SOURCE_SYSTEM_EKOKARTY = "ekokarty"
+
 DETAIL_PATH = "/documents/details/id/{sios_id}"
 SEARCH_PATH = "/search/common"
 # Increment when normalized fields or parser semantics change. Existing cards
 # then establish a new baseline instead of emitting source-data CHANGED events.
 CARD_PARSER_VERSION = "2"
+
+
+def canonical_record_key(source_system: str, native_record_id: str) -> str:
+    return "{}:{}".format(source_system, native_record_id)
 
 
 def detail_url(base_url: str, sios_id: int) -> str:
@@ -49,7 +56,7 @@ class SearchHit:
 
 @dataclass
 class CardRecord:
-    sios_id: int
+    sios_id: Optional[int]
     card_number: Optional[str]
     year: Optional[int]
     document_name: Optional[str]
@@ -63,9 +70,27 @@ class CardRecord:
     raw_fields: dict[str, Any]
     parser_version: str = CARD_PARSER_VERSION
     search_metadata: dict[str, Any] = field(default_factory=dict)
+    source_system: str = SOURCE_SYSTEM_SIOS
+    native_record_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.source_system == SOURCE_SYSTEM_SIOS:
+            if self.sios_id is None:
+                raise ValueError("sios_id is required for SIOS records")
+            if not self.native_record_id:
+                self.native_record_id = str(self.sios_id)
+        elif not self.native_record_id:
+            raise ValueError("native_record_id is required")
+
+    @property
+    def canonical_key(self) -> str:
+        return canonical_record_key(self.source_system, self.native_record_id)
 
     def to_jsonable(self) -> dict[str, Any]:
         return {
+            "source_system": self.source_system,
+            "native_record_id": self.native_record_id,
+            "canonical_key": self.canonical_key,
             "sios_id": self.sios_id,
             "card_number": self.card_number,
             "year": self.year,

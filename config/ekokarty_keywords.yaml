@@ -1,0 +1,20 @@
+# EkoKarty keyword groups. Queries are independent and unioned by
+# (ekokarty, "{slug}:{card_id}"). These are not assumed to match SIOS
+# keyword behaviour: EkoKarty uses karty_all full-text search, is not
+# stemming, and hits a 2000-row listing cap on broad terms.
+
+species:
+  - "bóbr"
+  - "bobry"
+  - "Castor fiber"
+  - "bobra europejskiego"
+
+protected_species:
+  - "zwierząt chronionych"
+  - "gatunków chronionych"
+
+interventions:
+  - "odstrzał"
+  - "tama"
+  - "tamy"
+  - "żeremie"

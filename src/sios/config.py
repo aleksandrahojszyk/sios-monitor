@@ -9,6 +9,17 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_COLLECTOR_CONFIG = PROJECT_ROOT / "config" / "collector.yaml"
 DEFAULT_KEYWORDS_CONFIG = PROJECT_ROOT / "config" / "keywords.yaml"
+DEFAULT_SOURCES_CONFIG = PROJECT_ROOT / "config" / "sources.yaml"
+
+
+@dataclass(frozen=True)
+class SourceConfig:
+    key: str
+    name: str
+    adapter: str
+    scope: str
+    enabled: bool
+    params: dict[str, int]
 
 
 @dataclass
@@ -81,6 +92,42 @@ def load_keyword_groups(path: Path | None = None) -> dict[str, list[str]]:
         if keywords:
             groups[str(group)] = keywords
     return groups
+
+
+def load_sources(path: Path | None = None) -> dict[str, SourceConfig]:
+    config_path = path or DEFAULT_SOURCES_CONFIG
+    raw_sources = load_yaml(config_path).get("sources")
+    if not isinstance(raw_sources, dict):
+        raise ValueError(f"Expected 'sources' mapping in {config_path}")
+
+    sources: dict[str, SourceConfig] = {}
+    for key, raw in raw_sources.items():
+        if not isinstance(raw, dict):
+            raise ValueError(f"Expected mapping for source {key!r}")
+        raw_params = raw.get("params", {})
+        if not isinstance(raw_params, dict):
+            raise ValueError(f"Expected params mapping for source {key!r}")
+        params = {str(name): int(value) for name, value in raw_params.items()}
+        source = SourceConfig(
+            key=str(key),
+            name=str(raw.get("name", key)),
+            adapter=str(raw.get("adapter", "")),
+            scope=str(raw.get("scope", "")),
+            enabled=bool(raw.get("enabled", False)),
+            params=params,
+        )
+        if source.adapter != "sios":
+            raise ValueError(f"Unsupported adapter for source {key!r}: {source.adapter!r}")
+        if source.scope == "province":
+            if source.params.get("iid") != 0:
+                raise ValueError(f"Province source {key!r} must use iid=0")
+            province_id = source.params.get("id_provinces")
+            if province_id is None or not 1 <= province_id <= 16:
+                raise ValueError(
+                    f"Province source {key!r} has invalid id_provinces"
+                )
+        sources[source.key] = source
+    return sources
 
 
 def flatten_keywords(groups: dict[str, list[str]]) -> list[str]:

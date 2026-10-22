@@ -1,0 +1,7 @@
+# Institution datasets hosted on ekokarty.pl.
+# Only enable slugs that have been verified. Do not crawl the whole platform.
+
+rdos-warszawa:
+  enabled: true
+  name: "Regionalna Dyrekcja Ochrony Środowiska w Warszawie"
+  slug: "rdos-warszawa"

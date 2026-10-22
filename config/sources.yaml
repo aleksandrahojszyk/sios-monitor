@@ -1,0 +1,144 @@
+sources:
+  dolnoslaskie:
+    name: "dolnośląskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 1
+
+  kujawsko_pomorskie:
+    name: "kujawsko-pomorskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 2
+
+  lubelskie:
+    name: "lubelskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 3
+
+  lubuskie:
+    name: "lubuskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 4
+
+  lodzkie:
+    name: "łódzkie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 5
+
+  malopolskie:
+    name: "małopolskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 6
+
+  mazowieckie:
+    name: "mazowieckie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 7
+
+  opolskie:
+    name: "opolskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 8
+
+  podkarpackie:
+    name: "podkarpackie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 9
+
+  podlaskie:
+    name: "podlaskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 10
+
+  pomorskie:
+    name: "pomorskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 11
+
+  slaskie:
+    name: "śląskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 12
+
+  swietokrzyskie:
+    name: "świętokrzyskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 13
+
+  warminsko_mazurskie:
+    name: "warmińsko-mazurskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 14
+
+  wielkopolskie:
+    name: "wielkopolskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 15
+
+  zachodniopomorskie:
+    name: "zachodniopomorskie"
+    adapter: "sios"
+    scope: "province"
+    enabled: true
+    params:
+      iid: 0
+      id_provinces: 16

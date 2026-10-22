@@ -23,7 +23,7 @@ from src.sios.collector import (
     main,
     print_summary,
 )
-from src.sios.config import CollectorSettings
+from src.sios.config import CollectorSettings, SourceConfig
 from src.sios.models import CardRecord
 from src.sios.storage import Storage
 
@@ -155,6 +155,7 @@ def make_window_collector(
     tmp_path: Path,
     storage: Storage | None = None,
     client: WindowClient | None = None,
+    source: SourceConfig | None = None,
 ) -> tuple[Collector, Storage, WindowClient]:
     storage = storage or Storage(tmp_path / "sios.sqlite")
     settings = CollectorSettings(
@@ -173,7 +174,7 @@ def make_window_collector(
         project_root=tmp_path,
     )
     client = client or WindowClient()
-    return Collector(settings, storage, client), storage, client  # type: ignore[arg-type]
+    return Collector(settings, storage, client, source=source), storage, client  # type: ignore[arg-type]
 
 
 def store_known_card_three(storage: Storage) -> None:
@@ -253,10 +254,14 @@ def _latest_run(storage: Storage):
 
 
 def seed_successful_window(
-    storage: Storage, keyword: str, window_end: str
+    storage: Storage,
+    keyword: str,
+    window_end: str,
+    source_key: str | None = None,
 ) -> int:
     run_id = storage.start_run(
         keyword,
+        source_key=source_key,
         window_start="2026-01-01",
         window_end=window_end,
         window_mode=WINDOW_MODE_EXPLICIT,
@@ -270,6 +275,17 @@ def seed_successful_window(
         stop_reason=STOP_WINDOW_PASSED,
     )
     return run_id
+
+
+def province_source(key: str, province_id: int) -> SourceConfig:
+    return SourceConfig(
+        key=key,
+        name=key,
+        adapter="sios",
+        scope="province",
+        enabled=True,
+        params={"iid": 0, "id_provinces": province_id},
+    )
 
 
 def test_max_pages_is_stored_on_the_run(tmp_path: Path) -> None:
@@ -492,6 +508,54 @@ def test_automatic_incremental_run_uses_watermark_overlap_and_skips_known(
     assert run["overlap_days"] == 1
 
 
+def test_incremental_uses_only_its_source_watermark(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "sios.sqlite")
+    seed_successful_window(
+        storage,
+        "bóbr",
+        "2026-10-05",
+        source_key="dolnoslaskie",
+    )
+    source = province_source("pomorskie", 11)
+    collector, _, client = make_window_collector(
+        tmp_path,
+        storage=storage,
+        source=source,
+    )
+
+    with pytest.raises(NoWatermarkError):
+        collector.collect_keyword_incremental(
+            "bóbr",
+            until=date(2026, 10, 6),
+        )
+
+    assert client.search_calls == []
+
+
+def test_known_card_records_province_source_without_detail_refetch(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "sios.sqlite")
+    store_known_card_three(storage)
+    source = province_source("mazowieckie", 7)
+    collector, _, client = make_window_collector(
+        tmp_path,
+        storage=storage,
+        source=source,
+    )
+
+    collector.collect_keyword_window(
+        "bóbr",
+        since=date(2026, 10, 5),
+        until=date(2026, 10, 6),
+    )
+
+    assert 3 not in client.detail_calls
+    assert storage.sources_for(3) == ["mazowieckie"]
+    run = _latest_run(storage)
+    assert run["source_key"] == "mazowieckie"
+
+
 def test_automatic_incremental_overlap_includes_boundary_without_duplicates(
     tmp_path: Path,
 ) -> None:
@@ -616,9 +680,51 @@ def test_card_id_cli_failure_returns_nonzero(tmp_path: Path, monkeypatch) -> Non
 
 
 def test_keyword_cli_success_returns_zero(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("src.sios.collector.SiosClient", lambda **kwargs: FakeClient())
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient()
+
+    monkeypatch.setattr("src.sios.collector.SiosClient", client_factory)
     config = _write_config(tmp_path)
     assert main(["--keyword", "bóbr", "--config", str(config), "--max-pages", "1", "--log-level", "ERROR"]) == 0
+    assert captured["search_params"] is None
+    assert _latest_run(Storage(tmp_path / "sios.sqlite"))["source_key"] is None
+
+
+def test_source_cli_applies_registry_params_and_persists_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient()
+
+    monkeypatch.setattr("src.sios.collector.SiosClient", client_factory)
+    config = _write_config(tmp_path)
+
+    code = main(
+        [
+            "--keyword",
+            "bóbr",
+            "--source",
+            "dolnoslaskie",
+            "--config",
+            str(config),
+            "--max-pages",
+            "1",
+            "--log-level",
+            "ERROR",
+        ]
+    )
+
+    assert code == 0
+    assert captured["search_params"] == {"iid": 0, "id_provinces": 1}
+    storage = Storage(tmp_path / "sios.sqlite")
+    assert _latest_run(storage)["source_key"] == "dolnoslaskie"
+    assert storage.sources_for(449913) == ["dolnoslaskie"]
 
 
 def test_keyword_cli_explicit_since_until_uses_bounded_mode(

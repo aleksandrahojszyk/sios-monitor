@@ -8,13 +8,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .models import CardRecord
+from .models import SOURCE_SYSTEM_SIOS, CardRecord
 
 STATUS_NEW = "NEW"
 STATUS_CHANGED = "CHANGED"
 STATUS_UNCHANGED = "UNCHANGED"
 CHANGE_ORIGIN_SOURCE = "SOURCE"
 CHANGE_ORIGIN_PARSER_BASELINE = "PARSER_BASELINE"
+
+WATERMARK_STOP_REASONS = (
+    "WINDOW_PASSED",
+    "EMPTY_PAGE",
+    "REPEATED_PAGE",
+    "NO_NEW_IDS",
+    "WINDOW_COMPLETE",
+    "EMPTY_WINDOW",
+)
 
 # Search-hit context, not the public card. Keyword overlap lives in keyword_matches.
 _IGNORED_RAW_KEYS = {"_search"}
@@ -87,9 +96,11 @@ def diff_content(old: dict[str, Any], new: dict[str, Any]) -> dict[str, dict[str
 @dataclass
 class UpsertResult:
     created: bool
-    sios_id: int
+    source_system: str
+    native_record_id: str
     status: str
     content_hash: str
+    sios_id: Optional[int] = None
     changed_fields: Optional[dict[str, Any]] = None
     change_origin: Optional[str] = None
 
@@ -98,19 +109,24 @@ class Storage:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path))
+        self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
+        self.conn.execute("PRAGMA foreign_keys = ON")
 
     def close(self) -> None:
         self.conn.close()
 
     def _init_schema(self) -> None:
+        # Migrations rebuild parent tables. Keep FK checks off until the
+        # namespaced identity exists, otherwise SQLite reports a mismatch.
+        self.conn.execute("PRAGMA foreign_keys = OFF")
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS cards (
-                sios_id INTEGER PRIMARY KEY,
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
+                sios_id INTEGER UNIQUE,
                 card_number TEXT,
                 year INTEGER,
                 document_name TEXT,
@@ -118,19 +134,24 @@ class Storage:
                 case_reference TEXT,
                 authority TEXT,
                 location TEXT,
+                listing_date TEXT,
                 dates_json TEXT NOT NULL DEFAULT '{}',
                 source_url TEXT NOT NULL,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 raw_fields_json TEXT NOT NULL DEFAULT '{}',
-                parser_version TEXT NOT NULL
+                parser_version TEXT NOT NULL,
+                PRIMARY KEY (source_system, native_record_id)
             );
 
             CREATE TABLE IF NOT EXISTS keyword_matches (
-                sios_id INTEGER NOT NULL,
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
                 keyword TEXT NOT NULL,
-                PRIMARY KEY (sios_id, keyword),
-                FOREIGN KEY (sios_id) REFERENCES cards(sios_id)
+                sios_id INTEGER,
+                PRIMARY KEY (source_system, native_record_id, keyword),
+                FOREIGN KEY (source_system, native_record_id)
+                    REFERENCES cards(source_system, native_record_id)
             );
 
             CREATE TABLE IF NOT EXISTS collection_runs (
@@ -138,6 +159,7 @@ class Storage:
                 started_at TEXT NOT NULL,
                 finished_at TEXT,
                 keyword TEXT,
+                source_key TEXT,
                 pages_processed INTEGER NOT NULL DEFAULT 0,
                 cards_found INTEGER NOT NULL DEFAULT 0,
                 new_cards INTEGER NOT NULL DEFAULT 0,
@@ -158,6 +180,7 @@ class Storage:
                 cards_skipped_too_new INTEGER NOT NULL DEFAULT 0,
                 known_cards_skipped INTEGER NOT NULL DEFAULT 0,
                 detail_pages_fetched INTEGER NOT NULL DEFAULT 0,
+                window_splits INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 error TEXT
             );
@@ -165,7 +188,9 @@ class Storage:
             CREATE TABLE IF NOT EXISTS card_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id INTEGER NOT NULL,
-                sios_id INTEGER NOT NULL,
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
+                sios_id INTEGER,
                 observed_at TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('NEW', 'CHANGED', 'UNCHANGED')),
                 content_hash TEXT NOT NULL,
@@ -176,7 +201,8 @@ class Storage:
                     change_origin IN ('SOURCE', 'PARSER_BASELINE')
                 ),
                 FOREIGN KEY (run_id) REFERENCES collection_runs(run_id),
-                FOREIGN KEY (sios_id) REFERENCES cards(sios_id)
+                FOREIGN KEY (source_system, native_record_id)
+                    REFERENCES cards(source_system, native_record_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_card_observations_sios_id
@@ -187,6 +213,18 @@ class Storage:
         )
         self._migrate_collection_runs()
         self._migrate_parser_versions()
+        self._migrate_record_identities()
+        self._migrate_namespaced_primary_key()
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_card_observations_identity
+            ON card_observations(source_system, native_record_id)
+            """
+        )
+        self._init_record_sources()
+        from src.inbox.schema import init_review_schema
+
+        init_review_schema(self.conn)
         self.conn.commit()
 
     def _migrate_collection_runs(self) -> None:
@@ -214,6 +252,8 @@ class Storage:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN reported_total INTEGER")
         if "stop_reason" not in columns:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN stop_reason TEXT")
+        if "source_key" not in columns:
+            self.conn.execute("ALTER TABLE collection_runs ADD COLUMN source_key TEXT")
         if "window_start" not in columns:
             self.conn.execute("ALTER TABLE collection_runs ADD COLUMN window_start TEXT")
         if "window_end" not in columns:
@@ -240,6 +280,11 @@ class Storage:
                     "ALTER TABLE collection_runs ADD COLUMN {} "
                     "INTEGER NOT NULL DEFAULT 0".format(column)
                 )
+        if "window_splits" not in columns:
+            self.conn.execute(
+                "ALTER TABLE collection_runs ADD COLUMN window_splits "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _migrate_parser_versions(self) -> None:
         card_columns = {
@@ -264,6 +309,235 @@ class Storage:
                 "ALTER TABLE card_observations ADD COLUMN change_origin TEXT"
             )
 
+    def _migrate_record_identities(self) -> None:
+        columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(cards)")
+        }
+        if "source_system" not in columns:
+            self.conn.execute(
+                "ALTER TABLE cards ADD COLUMN source_system "
+                "TEXT NOT NULL DEFAULT 'sios'"
+            )
+        if "native_record_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE cards ADD COLUMN native_record_id TEXT"
+            )
+        self.conn.execute(
+            """
+            UPDATE cards
+            SET source_system = ?, native_record_id = CAST(sios_id AS TEXT)
+            WHERE native_record_id IS NULL OR native_record_id = ''
+            """,
+            (SOURCE_SYSTEM_SIOS,),
+        )
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_source_identity
+            ON cards(source_system, native_record_id)
+            """
+        )
+
+    def _table_columns(self, table: str) -> list[str]:
+        return [
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info({})".format(table))
+        ]
+
+    def _primary_key_columns(self, table: str) -> list[str]:
+        rows = list(self.conn.execute("PRAGMA table_info({})".format(table)))
+        ordered = sorted((row for row in rows if row["pk"] > 0), key=lambda row: row["pk"])
+        return [str(row["name"]) for row in ordered]
+
+    def _migrate_namespaced_primary_key(self) -> None:
+        """Move identity off sios_id so EkoKarty rows cannot collide with SIOS IDs."""
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            if self._primary_key_columns("cards") == ["sios_id"]:
+                self._rebuild_cards_table()
+            keyword_columns = set(self._table_columns("keyword_matches"))
+            if "sios_id" in keyword_columns and "source_system" not in keyword_columns:
+                self._rebuild_keyword_matches()
+            observation_columns = set(self._table_columns("card_observations"))
+            if observation_columns and "source_system" not in observation_columns:
+                self._rebuild_observations()
+            card_columns = set(self._table_columns("cards"))
+            if "listing_date" not in card_columns:
+                self.conn.execute("ALTER TABLE cards ADD COLUMN listing_date TEXT")
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _rebuild_cards_table(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE cards_new (
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
+                sios_id INTEGER UNIQUE,
+                card_number TEXT,
+                year INTEGER,
+                document_name TEXT,
+                document_type TEXT,
+                case_reference TEXT,
+                authority TEXT,
+                location TEXT,
+                listing_date TEXT,
+                dates_json TEXT NOT NULL DEFAULT '{}',
+                source_url TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                raw_fields_json TEXT NOT NULL DEFAULT '{}',
+                parser_version TEXT NOT NULL,
+                PRIMARY KEY (source_system, native_record_id)
+            )
+            """
+        )
+        old_columns = set(self._table_columns("cards"))
+        select_listing = (
+            "listing_date" if "listing_date" in old_columns else "NULL"
+        )
+        self.conn.execute(
+            """
+            INSERT INTO cards_new (
+                source_system, native_record_id, sios_id, card_number, year,
+                document_name, document_type, case_reference, authority,
+                location, listing_date, dates_json, source_url, first_seen_at,
+                last_seen_at, raw_fields_json, parser_version
+            )
+            SELECT
+                source_system,
+                native_record_id,
+                sios_id,
+                card_number,
+                year,
+                document_name,
+                document_type,
+                case_reference,
+                authority,
+                location,
+                {},
+                dates_json,
+                source_url,
+                first_seen_at,
+                last_seen_at,
+                raw_fields_json,
+                parser_version
+            FROM cards
+            """.format(select_listing)
+        )
+        self.conn.execute("DROP TABLE cards")
+        self.conn.execute("ALTER TABLE cards_new RENAME TO cards")
+
+    def _rebuild_keyword_matches(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE keyword_matches_new (
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                sios_id INTEGER,
+                PRIMARY KEY (source_system, native_record_id, keyword),
+                FOREIGN KEY (source_system, native_record_id)
+                    REFERENCES cards(source_system, native_record_id)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO keyword_matches_new (
+                source_system, native_record_id, keyword, sios_id
+            )
+            SELECT ?, CAST(sios_id AS TEXT), keyword, sios_id
+            FROM keyword_matches
+            """,
+            (SOURCE_SYSTEM_SIOS,),
+        )
+        self.conn.execute("DROP TABLE keyword_matches")
+        self.conn.execute("ALTER TABLE keyword_matches_new RENAME TO keyword_matches")
+
+    def _rebuild_observations(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE card_observations_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
+                sios_id INTEGER,
+                observed_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('NEW', 'CHANGED', 'UNCHANGED')),
+                content_hash TEXT NOT NULL,
+                changed_fields_json TEXT,
+                parser_version TEXT NOT NULL,
+                change_origin TEXT CHECK (
+                    change_origin IS NULL OR
+                    change_origin IN ('SOURCE', 'PARSER_BASELINE')
+                ),
+                FOREIGN KEY (run_id) REFERENCES collection_runs(run_id),
+                FOREIGN KEY (source_system, native_record_id)
+                    REFERENCES cards(source_system, native_record_id)
+            )
+            """
+        )
+        columns = set(self._table_columns("card_observations"))
+        parser_select = (
+            "COALESCE(parser_version, '')" if "parser_version" in columns else "''"
+        )
+        origin_select = "change_origin" if "change_origin" in columns else "NULL"
+        self.conn.execute(
+            """
+            INSERT INTO card_observations_new (
+                id, run_id, source_system, native_record_id, sios_id,
+                observed_at, status, content_hash, changed_fields_json,
+                parser_version, change_origin
+            )
+            SELECT
+                id, run_id, ?, CAST(sios_id AS TEXT), sios_id,
+                observed_at, status, content_hash, changed_fields_json,
+                {}, {}
+            FROM card_observations
+            """.format(parser_select, origin_select),
+            (SOURCE_SYSTEM_SIOS,),
+        )
+        self.conn.execute("DROP TABLE card_observations")
+        self.conn.execute("ALTER TABLE card_observations_new RENAME TO card_observations")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_card_observations_identity
+            ON card_observations(source_system, native_record_id)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_card_observations_sios_id
+            ON card_observations(sios_id)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_card_observations_run_id
+            ON card_observations(run_id)
+            """
+        )
+
+    def _init_record_sources(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS record_sources (
+                source_system TEXT NOT NULL,
+                native_record_id TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (source_system, native_record_id, source_key),
+                FOREIGN KEY (source_system, native_record_id)
+                    REFERENCES cards(source_system, native_record_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_record_sources_source_key
+                ON record_sources(source_key);
+            """
+        )
+
     def start_run(
         self,
         keyword: Optional[str],
@@ -273,14 +547,15 @@ class Storage:
         window_mode: Optional[str] = None,
         watermark_used: Optional[str] = None,
         overlap_days: int = 0,
+        source_key: Optional[str] = None,
     ) -> int:
         cur = self.conn.execute(
             """
             INSERT INTO collection_runs (
                 started_at, keyword, window_start, window_end, window_mode,
-                watermark_used, overlap_days, status
+                watermark_used, overlap_days, source_key, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')
             """,
             (
                 utc_now(),
@@ -290,32 +565,41 @@ class Storage:
                 window_mode,
                 watermark_used,
                 overlap_days,
+                source_key,
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def last_successful_window_end(self, keyword: str) -> Optional[str]:
-        """Return the latest complete bounded-run end date for one keyword.
+    def last_successful_window_end(
+        self, keyword: str, source_key: Optional[str] = None
+    ) -> Optional[str]:
+        """Return the latest safe end date for one keyword and source.
 
         Incomplete caps and failed/partial runs must never advance the
-        incremental watermark.
+        incremental watermark. A NULL source is the legacy/manual nationwide
+        scope and never advances a named source's watermark.
         """
         row = self.conn.execute(
             """
             SELECT window_end
             FROM collection_runs
             WHERE keyword = ?
+              AND (
+                  (? IS NULL AND source_key IS NULL)
+                  OR source_key = ?
+              )
               AND status = 'ok'
               AND window_end IS NOT NULL
               AND stop_reason IN (
                   'WINDOW_PASSED', 'EMPTY_PAGE',
-                  'REPEATED_PAGE', 'NO_NEW_IDS'
+                  'REPEATED_PAGE', 'NO_NEW_IDS',
+                  'WINDOW_COMPLETE', 'EMPTY_WINDOW'
               )
             ORDER BY finished_at DESC, run_id DESC
             LIMIT 1
             """,
-            (keyword,),
+            (keyword, source_key, source_key),
         ).fetchone()
         return str(row["window_end"]) if row is not None else None
 
@@ -340,6 +624,7 @@ class Storage:
         cards_skipped_too_new: int = 0,
         known_cards_skipped: int = 0,
         detail_pages_fetched: int = 0,
+        window_splits: int = 0,
     ) -> None:
         self.conn.execute(
             """
@@ -350,7 +635,7 @@ class Storage:
                 stop_reason = ?, cards_encountered = ?, cards_in_window = ?,
                 cards_skipped_too_old = ?, cards_skipped_too_new = ?,
                 known_cards_skipped = ?, detail_pages_fetched = ?,
-                status = ?, error = ?
+                window_splits = ?, status = ?, error = ?
             WHERE run_id = ?
             """,
             (
@@ -370,6 +655,7 @@ class Storage:
                 cards_skipped_too_new,
                 known_cards_skipped,
                 detail_pages_fetched,
+                window_splits,
                 status,
                 error,
                 run_id,
@@ -378,16 +664,32 @@ class Storage:
         self.conn.commit()
 
     def has_card(self, sios_id: int) -> bool:
+        return self.has_record(SOURCE_SYSTEM_SIOS, str(sios_id))
+
+    def has_record(self, source_system: str, native_record_id: str) -> bool:
         row = self.conn.execute(
-            "SELECT 1 FROM cards WHERE sios_id = ?", (sios_id,)
+            """
+            SELECT 1 FROM cards
+            WHERE source_system = ? AND native_record_id = ?
+            """,
+            (source_system, native_record_id),
         ).fetchone()
         return row is not None
 
-    def upsert_card(self, record: CardRecord, run_id: Optional[int] = None) -> UpsertResult:
+    def upsert_card(
+        self,
+        record: CardRecord,
+        run_id: Optional[int] = None,
+        source_key: Optional[str] = None,
+    ) -> UpsertResult:
         now = utc_now()
+        listing_date = record.dates.get("listing_date") if record.dates else None
         existing = self.conn.execute(
-            "SELECT * FROM cards WHERE sios_id = ?",
-            (record.sios_id,),
+            """
+            SELECT * FROM cards
+            WHERE source_system = ? AND native_record_id = ?
+            """,
+            (record.source_system, record.native_record_id),
         ).fetchone()
         payload = content_payload_from_record(record)
         digest = content_hash(payload)
@@ -398,12 +700,15 @@ class Storage:
             self.conn.execute(
                 """
                 INSERT INTO cards (
-                    sios_id, card_number, year, document_name, document_type,
-                    case_reference, authority, location, dates_json, source_url,
+                    source_system, native_record_id, sios_id, card_number, year,
+                    document_name, document_type, case_reference, authority,
+                    location, listing_date, dates_json, source_url,
                     first_seen_at, last_seen_at, raw_fields_json, parser_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    record.source_system,
+                    record.native_record_id,
                     record.sios_id,
                     record.card_number,
                     record.year,
@@ -412,6 +717,7 @@ class Storage:
                     record.case_reference,
                     record.authority,
                     record.location,
+                    listing_date,
                     json.dumps(record.dates, ensure_ascii=False),
                     record.source_url,
                     now,
@@ -425,8 +731,8 @@ class Storage:
             parser_changed = existing["parser_version"] != record.parser_version
             if parser_changed:
                 # Parser evolution may add, remove, or reinterpret fields. Store
-                # the refreshed payload as a baseline without claiming SIOS
-                # changed. The diff remains available for audit.
+                # the refreshed payload as a baseline without claiming the
+                # source changed. The diff remains available for audit.
                 status = STATUS_UNCHANGED
                 change_origin = CHANGE_ORIGIN_PARSER_BASELINE
             elif changed_fields:
@@ -446,12 +752,13 @@ class Storage:
                         case_reference = ?,
                         authority = ?,
                         location = ?,
+                        listing_date = ?,
                         dates_json = ?,
                         source_url = ?,
                         last_seen_at = ?,
                         raw_fields_json = ?,
                         parser_version = ?
-                    WHERE sios_id = ?
+                    WHERE source_system = ? AND native_record_id = ?
                     """,
                     (
                         record.card_number,
@@ -461,37 +768,52 @@ class Storage:
                         record.case_reference,
                         record.authority,
                         record.location,
+                        listing_date,
                         json.dumps(record.dates, ensure_ascii=False),
                         record.source_url,
                         now,
                         json.dumps(record.raw_fields, ensure_ascii=False),
                         record.parser_version,
-                        record.sios_id,
+                        record.source_system,
+                        record.native_record_id,
                     ),
                 )
             else:
                 self.conn.execute(
-                    "UPDATE cards SET last_seen_at = ? WHERE sios_id = ?",
-                    (now, record.sios_id),
+                    """
+                    UPDATE cards SET last_seen_at = ?
+                    WHERE source_system = ? AND native_record_id = ?
+                    """,
+                    (now, record.source_system, record.native_record_id),
                 )
         for keyword in record.matched_keywords:
-            self.conn.execute(
-                """
-                INSERT OR IGNORE INTO keyword_matches (sios_id, keyword)
-                VALUES (?, ?)
-                """,
-                (record.sios_id, keyword),
+            self.add_record_keyword_match(
+                record.source_system,
+                record.native_record_id,
+                keyword,
+                sios_id=record.sios_id,
+                commit=False,
+            )
+        if source_key is not None:
+            self._link_record_source(
+                record.source_system,
+                record.native_record_id,
+                source_key,
+                observed_at=now,
             )
         if run_id is not None:
             self.conn.execute(
                 """
                 INSERT INTO card_observations (
-                    run_id, sios_id, observed_at, status, content_hash,
-                    changed_fields_json, parser_version, change_origin
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    run_id, source_system, native_record_id, sios_id,
+                    observed_at, status, content_hash, changed_fields_json,
+                    parser_version, change_origin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
+                    record.source_system,
+                    record.native_record_id,
                     record.sios_id,
                     now,
                     status,
@@ -506,6 +828,8 @@ class Storage:
         self.conn.commit()
         return UpsertResult(
             created=status == STATUS_NEW,
+            source_system=record.source_system,
+            native_record_id=record.native_record_id,
             sios_id=record.sios_id,
             status=status,
             content_hash=digest,
@@ -513,26 +837,136 @@ class Storage:
             change_origin=change_origin,
         )
 
-    def add_keyword_match(self, sios_id: int, keyword: str) -> None:
+    def _link_record_source(
+        self,
+        source_system: str,
+        native_record_id: str,
+        source_key: str,
+        *,
+        observed_at: str,
+    ) -> None:
         self.conn.execute(
             """
-            INSERT OR IGNORE INTO keyword_matches (sios_id, keyword)
-            VALUES (?, ?)
+            INSERT OR IGNORE INTO record_sources (
+                source_system, native_record_id, source_key,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?)
             """,
-            (sios_id, keyword),
+            (
+                source_system,
+                native_record_id,
+                source_key,
+                observed_at,
+                observed_at,
+            ),
+        )
+        self.conn.execute(
+            """
+            UPDATE record_sources
+            SET last_seen_at = ?
+            WHERE source_system = ?
+              AND native_record_id = ?
+              AND source_key = ?
+            """,
+            (observed_at, source_system, native_record_id, source_key),
+        )
+
+    def link_sios_record_source(self, sios_id: int, source_key: str) -> None:
+        self._link_record_source(
+            SOURCE_SYSTEM_SIOS,
+            str(sios_id),
+            source_key,
+            observed_at=utc_now(),
         )
         self.conn.commit()
 
-    def observations_for(self, sios_id: int) -> list[dict[str, Any]]:
+    def sources_for(self, sios_id: int) -> list[str]:
         rows = self.conn.execute(
             """
-            SELECT id, run_id, sios_id, observed_at, status, content_hash,
-                   changed_fields_json, parser_version, change_origin
+            SELECT source_key
+            FROM record_sources
+            WHERE source_system = ? AND native_record_id = ?
+            ORDER BY source_key
+            """,
+            (SOURCE_SYSTEM_SIOS, str(sios_id)),
+        ).fetchall()
+        return [str(row["source_key"]) for row in rows]
+
+    def add_keyword_match(self, sios_id: int, keyword: str) -> None:
+        self.add_record_keyword_match(
+            SOURCE_SYSTEM_SIOS, str(sios_id), keyword, sios_id=sios_id
+        )
+
+    def add_record_keyword_match(
+        self,
+        source_system: str,
+        native_record_id: str,
+        keyword: str,
+        *,
+        sios_id: Optional[int] = None,
+        commit: bool = True,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO keyword_matches (
+                source_system, native_record_id, keyword, sios_id
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (source_system, native_record_id, keyword, sios_id),
+        )
+        if commit:
+            self.conn.commit()
+
+    def mark_record_seen(
+        self,
+        source_system: str,
+        native_record_id: str,
+        *,
+        keyword: Optional[str] = None,
+        source_key: Optional[str] = None,
+        sios_id: Optional[int] = None,
+    ) -> None:
+        now = utc_now()
+        self.conn.execute(
+            """
+            UPDATE cards SET last_seen_at = ?
+            WHERE source_system = ? AND native_record_id = ?
+            """,
+            (now, source_system, native_record_id),
+        )
+        if keyword:
+            self.add_record_keyword_match(
+                source_system,
+                native_record_id,
+                keyword,
+                sios_id=sios_id,
+                commit=False,
+            )
+        if source_key is not None:
+            self._link_record_source(
+                source_system,
+                native_record_id,
+                source_key,
+                observed_at=now,
+            )
+        self.conn.commit()
+
+    def observations_for(self, sios_id: int) -> list[dict[str, Any]]:
+        return self.observations_for_record(SOURCE_SYSTEM_SIOS, str(sios_id))
+
+    def observations_for_record(
+        self, source_system: str, native_record_id: str
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, run_id, source_system, native_record_id, sios_id,
+                   observed_at, status, content_hash, changed_fields_json,
+                   parser_version, change_origin
             FROM card_observations
-            WHERE sios_id = ?
+            WHERE source_system = ? AND native_record_id = ?
             ORDER BY id
             """,
-            (sios_id,),
+            (source_system, native_record_id),
         ).fetchall()
         observations: list[dict[str, Any]] = []
         for row in rows:
@@ -543,23 +977,55 @@ class Storage:
         return observations
 
     def keywords_for(self, sios_id: int) -> list[str]:
+        return self.keywords_for_record(SOURCE_SYSTEM_SIOS, str(sios_id))
+
+    def keywords_for_record(self, source_system: str, native_record_id: str) -> list[str]:
         rows = self.conn.execute(
-            "SELECT keyword FROM keyword_matches WHERE sios_id = ? ORDER BY keyword",
-            (sios_id,),
+            """
+            SELECT keyword FROM keyword_matches
+            WHERE source_system = ? AND native_record_id = ?
+            ORDER BY keyword
+            """,
+            (source_system, native_record_id),
         ).fetchall()
         return [row["keyword"] for row in rows]
 
     def get_card(self, sios_id: int) -> Optional[dict[str, Any]]:
+        return self.get_record(SOURCE_SYSTEM_SIOS, str(sios_id))
+
+    def get_record(
+        self, source_system: str, native_record_id: str
+    ) -> Optional[dict[str, Any]]:
         row = self.conn.execute(
-            "SELECT * FROM cards WHERE sios_id = ?", (sios_id,)
+            """
+            SELECT * FROM cards
+            WHERE source_system = ? AND native_record_id = ?
+            """,
+            (source_system, native_record_id),
         ).fetchone()
         if row is None:
             return None
         data = dict(row)
         data["dates"] = json.loads(data.pop("dates_json") or "{}")
         data["raw_fields"] = json.loads(data.pop("raw_fields_json") or "{}")
-        data["matched_keywords"] = self.keywords_for(sios_id)
+        data["matched_keywords"] = self.keywords_for_record(
+            source_system, native_record_id
+        )
+        data["source_keys"] = self.sources_for_record(source_system, native_record_id)
+        data["canonical_key"] = "{}:{}".format(source_system, native_record_id)
         return data
+
+    def sources_for_record(self, source_system: str, native_record_id: str) -> list[str]:
+        rows = self.conn.execute(
+            """
+            SELECT source_key
+            FROM record_sources
+            WHERE source_system = ? AND native_record_id = ?
+            ORDER BY source_key
+            """,
+            (source_system, native_record_id),
+        ).fetchall()
+        return [str(row["source_key"]) for row in rows]
 
     def card_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM cards").fetchone()
@@ -570,9 +1036,13 @@ class Storage:
             return 0
         placeholders = ",".join("?" for _ in run_ids)
         row = self.conn.execute(
-            "SELECT COUNT(DISTINCT sios_id) AS n FROM card_observations WHERE run_id IN ({})".format(
-                placeholders
-            ),
+            """
+            SELECT COUNT(*) AS n FROM (
+                SELECT DISTINCT source_system, native_record_id
+                FROM card_observations
+                WHERE run_id IN ({})
+            )
+            """.format(placeholders),
             tuple(run_ids),
         ).fetchone()
         return int(row["n"])

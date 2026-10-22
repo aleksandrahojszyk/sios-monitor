@@ -68,6 +68,49 @@ crawling requires the approval noted above.
 
 Cards are never deleted because they disappear from one keyword result.
 
+## Province source scope
+
+The production monitoring registry is `config/sources.yaml`. Its 16 primary
+sources correspond to the 16 voivodeships and send `iid=0` together with the
+province's `id_provinces` value.
+
+- `id_provinces` limits card geography.
+- `iid` limits an institution/tenant.
+
+These filters are not interchangeable. A province search can and intentionally
+does include multiple publishers. For example, the verified dolnośląskie
+sample included both RDOŚ Wrocław and Starostwo Powiatowe w Kłodzku. Do not
+filter these results to RDOŚ: authority is stored from the card exactly as
+published so downstream work can separately identify RDOŚ, Wody Polskie,
+starostwa, municipalities, and other authorities.
+
+`collection_runs.source_key` records the search scope. `record_sources` records
+every province source through which a SIOS card was discovered. This provenance
+is separate from both record identity (`sios` + native numeric ID as text) and
+the card's legal publisher.
+
+The public EkoKarty register for RDOŚ Warszawa is documented in
+[EKOKARTY_RESEARCH.md](EKOKARTY_RESEARCH.md). It is a separate institution-scoped
+HTML source, not a nationwide SIOS equivalent. It does not replace the
+`mazowieckie` SIOS province source. The bounded adapter collects only
+`rdos-warszawa` (`python -m src.ekokarty.collector`). Other EkoKarty institutions
+can be added later through `config/ekokarty_sources.yaml`; do not enable them
+without a verified slug. The 16-RDOŚ coverage draft is
+[SOURCE_COVERAGE_DRAFT.md](SOURCE_COVERAGE_DRAFT.md).
+
+EkoKarty listing is one HTML POST per filter. There is no `page=` walk. Broad
+queries can return exactly 2000 rows; that is a cap. Bounded collection uses
+`data_od` / `data_do` against listing date (`Data zamieszczenie w wykazie` /
+listing `Data karty`). If a window returns `result_cap` rows, the collector
+splits the window, logs `ekokarty_window_split`, and continues. A single-day
+window that is still capped is stored as `RESULT_CAP` and does **not** advance
+the incremental watermark. Do not treat 2000 rows as a complete dataset.
+
+EkoKarty identity is `("ekokarty", "{slug}:{card_id}")`. Do not deduplicate
+against SIOS because card numbers, case marks, or titles look similar. Related
+card links and `znak sprawy` are stored as signals, not as a case model.
+Attachment URLs are recorded; files are not downloaded.
+
 ## Date-bounded runs
 
 Use `--since YYYY-MM-DD` and optionally `--until YYYY-MM-DD` for a capped
@@ -95,8 +138,8 @@ to use `--max-pages` as a separate operational safety cap.
 
 After a successful bounded baseline, use `--incremental` for subsequent runs.
 The watermark is the `window_end` of the latest safe, successful bounded run
-for the same keyword. The collector subtracts one day for overlap and defaults
-the new end to today.
+for the same source key and keyword. The collector subtracts one day for
+overlap and defaults the new end to today.
 
 Only `ok` runs ending with `WINDOW_PASSED`, `EMPTY_PAGE`, `REPEATED_PAGE`, or
 `NO_NEW_IDS` are eligible watermarks. Failed/partial runs and safety-cap stops
@@ -106,6 +149,23 @@ explicit `--since` rather than assuming seven days.
 Run metadata records whether the window was `AUTOMATIC` or `EXPLICIT`, the
 watermark used, and the overlap days. Explicit `--since` always wins when both
 it and `--incremental` are supplied.
+
+Watermarks are deliberately isolated by source. A completed run for one
+voivodeship cannot advance another voivodeship, and a legacy/manual nationwide
+run cannot seed a province watermark. Each province therefore needs its own
+explicit bounded baseline before automatic incremental collection.
+
+EkoKarty watermarks use the same `collection_runs` table and the same one-day
+overlap, keyed by institution `source_key` (for example `rdos-warszawa`) and
+keyword. Eligible EkoKarty stop reasons are `WINDOW_COMPLETE` and
+`EMPTY_WINDOW`. `RESULT_CAP` and `MAX_REQUESTS` never advance the watermark.
+The date basis is listing date, not SIOS `entered_at`.
+
+## Monitoring Inbox
+
+The Inbox (`python -m src.inbox.app`) is a local review UI over this SQLite
+file. It must not call SIOS or EkoKarty. Human review state lives in
+`card_reviews` / `review_events`. See [MONITORING_INBOX_MVP.md](MONITORING_INBOX_MVP.md).
 
 ## Personal data
 
