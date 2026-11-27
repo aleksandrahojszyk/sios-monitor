@@ -6,6 +6,7 @@
   <title>Monitoring Inbox</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='inbox.css') }}">
 </head>
+{% from '_claims.html' import flashes, account_bar, assignee, claim_controls with context %}
 <body>
   {% if usability_mode %}
   <div class="usability-banner" role="status">
@@ -22,11 +23,14 @@
       <h1>Monitoring Inbox</h1>
       <p class="lede">Triage collected SIOS and EkoKarty cards. A card is not a case.</p>
     </div>
+    {% if claims_enabled %}{{ account_bar() }}{% endif %}
     <p class="new-count" aria-live="polite">
       <span class="new-count__number">{{ metrics.total_new }}</span>
       <span class="new-count__label">new</span>
     </p>
   </header>
+
+  {{ flashes() }}
 
   <section class="metrics" aria-label="Operational metrics">
     <a class="metric" href="?status=NEW">
@@ -165,6 +169,7 @@
                   <span class="muted">{{ card.display_date_field }}</span>
                 </span>
                 <span class="status status--{{ card.review_status }}">{{ card.review_label }}</span>
+                {{ assignee(card) }}
               </div>
               <p class="row__title">{{ card.document_name or 'Untitled card' }}</p>
               <p class="row__meta">
@@ -201,6 +206,7 @@
                 </button>
               </form>
               {% endfor %}
+              {{ claim_controls(card, url_for('inbox') ~ '?' ~ filter_qs(query)) }}
             </div>
           </article>
         </li>

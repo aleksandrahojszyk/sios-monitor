@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Monitoring Inbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='inbox.css') }}">
+</head>
+<body class="detail-page">
+  <p><a href="{{ url_for('inbox') }}">Back to inbox</a></p>
+  <main class="login">
+    <p class="eyebrow">Nasz Bóbr</p>
+    <h1>Sign in</h1>
+    <p class="muted">Use your own team account to claim cards. Accounts are created by a team administrator.</p>
+    {% if error %}
+    <p class="flash flash--error" role="alert">{{ error }}</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('login') }}" class="note-form">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label>
+        Username
+        <input type="text" name="username" value="{{ username }}" autocomplete="username" required autofocus>
+      </label>
+      <label>
+        Password
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>
