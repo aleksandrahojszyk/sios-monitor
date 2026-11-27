@@ -169,3 +169,21 @@ code { font-size: 0.85em; }
   .filters__search { grid-column: auto; }
   .kv div { grid-template-columns: 1fr; }
 }
+.account-bar { display: flex; gap: 0.6rem; align-items: center; font-size: 0.85rem; }
+.account-bar form { margin: 0; }
+.flashes { max-width: 1200px; margin: 0 auto; padding: 0.5rem 1.25rem 0; }
+.flash { margin: 0.3rem 0; padding: 0.5rem 0.75rem; border: 1px solid var(--line); background: var(--panel); }
+.flash--error { border-color: #8c2f1b; color: #8c2f1b; font-weight: 650; }
+.flash--success { border-color: var(--eko); color: var(--eko); }
+.assignee {
+  font-size: 0.8rem;
+  font-weight: 650;
+  color: var(--sios);
+  border-left: 3px solid var(--sios);
+  padding-left: 0.4rem;
+}
+.claim form { margin: 0; }
+.claim .action--claim { border-color: var(--sios); color: var(--sios); }
+.ownership { border-top: 1px solid var(--line); margin-top: 0.8rem; padding-top: 0.4rem; }
+.ownership__line { margin: 0.3rem 0; }
+.login { max-width: 24rem; }

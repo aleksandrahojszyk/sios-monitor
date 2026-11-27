@@ -57,6 +57,26 @@ def init_review_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_usability_sessions_participant
             ON usability_sessions(participant_id, finished_at);
 
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            display_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS card_claims (
+            source_system TEXT NOT NULL,
+            native_record_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY (source_system, native_record_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_card_claims_user
+            ON card_claims(user_id);
+
         CREATE INDEX IF NOT EXISTS idx_cards_authority ON cards(authority);
         CREATE INDEX IF NOT EXISTS idx_cards_document_type ON cards(document_type);
         CREATE INDEX IF NOT EXISTS idx_cards_listing_date ON cards(listing_date);

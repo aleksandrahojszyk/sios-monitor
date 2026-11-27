@@ -96,6 +96,9 @@ class InboxCard:
     raw_fields: dict[str, Any] = field(default_factory=dict)
     related_cards: list[dict[str, Any]] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    assignee_user_id: Optional[int] = None
+    assignee_name: Optional[str] = None
+    claimed_at: Optional[str] = None
 
     @property
     def source_label(self) -> str:

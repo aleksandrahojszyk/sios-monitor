@@ -1,0 +1,48 @@
+{% macro flashes() %}
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+  <div class="flashes" role="status">
+    {% for category, message in messages %}
+    <p class="flash flash--{{ category }}">{{ message }}</p>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% endwith %}
+{% endmacro %}
+
+{% macro account_bar() %}
+  <nav class="account-bar" aria-label="Account">
+    {% if current_user %}
+    <span>Signed in as <strong>{{ current_user.display_name }}</strong></span>
+    <form method="post" action="{{ url_for('logout') }}">
+      <button type="submit" class="action">Sign out</button>
+    </form>
+    {% else %}
+    <a href="{{ url_for('login', next=request.full_path.rstrip('?')) }}">Sign in</a>
+    {% endif %}
+  </nav>
+{% endmacro %}
+
+{% macro assignee(card) %}
+  {% if claims_enabled and card.assignee_name %}
+  <span class="assignee" data-assignee="{{ card.assignee_name }}">Assigned to {{ card.assignee_name }}</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro claim_controls(card, next_url) %}
+  {% if claims_enabled %}
+  <div class="claim">
+    {% if not card.assignee_name %}
+    <form method="post" action="{{ url_for('card_claim', source_system=card.source_system, native_record_id=card.native_record_id) }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <button type="submit" class="action action--claim">Claim task</button>
+    </form>
+    {% elif current_user and card.assignee_user_id == current_user.id %}
+    <form method="post" action="{{ url_for('card_release', source_system=card.source_system, native_record_id=card.native_record_id) }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <button type="submit" class="action action--release">Release task</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+{% endmacro %}

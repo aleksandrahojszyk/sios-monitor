@@ -76,7 +76,25 @@ Identity examples already used in code:
 Lightweight product log: `card_viewed`, `status_changed` (previous and new
 status), `note_updated`, plus timestamp. No external analytics service.
 
-There is no user-account field. Authentication was not added for MVP.
+`review_events` has no user-account field; review actions are not attributed.
+
+### `users` and `card_claims`
+
+Individual accounts and task ownership, separate from triage:
+
+- `users`: unique `username` and unique `display_name` (case-insensitive),
+  salted password hash, `is_active`. Accounts are created by a team
+  administrator with `python -m src.inbox.users create`; there is no
+  self-registration.
+- `card_claims`: primary key `(source_system, native_record_id)`, so a card has
+  at most one assignee. A claim is a single `INSERT OR IGNORE`; of two
+  simultaneous claims SQLite lets exactly one succeed and the loser is told who
+  holds the card. Release deletes the row only when it belongs to the caller.
+
+Claims never touch `card_reviews`, the review status, or the default `NEW`
+queue. Sign-in is required to claim or release; reading the Inbox and changing
+review status behave as before. Claiming is hidden in isolated usability-test
+mode.
 
 ## Unified card read model
 
@@ -137,7 +155,9 @@ Geography filters do not apply to EkoKarty free-text areas.
 - Display dates are source-specific and should not be graphed as one timeline
   without a later mapping.
 - One note per card; no note history.
-- No login; anyone with access to the local app can change reviews.
+- Reading the Inbox and changing review status do not require sign-in; only
+  claim/release uses the signed-in account, and review actions are still not
+  attributed to a user.
 - Attachment rows are metadata only; files are not fetched.
 
 ## Future extension points
@@ -145,6 +165,6 @@ Geography filters do not apply to EkoKarty free-text areas.
 - Case entity created explicitly from `REQUEST_DOCUMENTS`
 - optional corroboration of SIOS ↔ EkoKarty on authority + znak sprawy, still
   keeping namespaced IDs
-- reviewer identity once authentication exists
-- saved views / assignment
+- attribute review actions to the signed-in user
+- saved views
 - richer related-card navigation that still is not a case model

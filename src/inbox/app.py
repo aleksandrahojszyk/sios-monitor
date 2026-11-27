@@ -1,14 +1,36 @@
 from __future__ import annotations
 
+import os
+import secrets
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
-from flask import Flask, abort, redirect, render_template, request, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 from src.sios.config import load_settings
 from src.sios.storage import Storage
 
+from .accounts import AccountRepository
+from .claims import (
+    OUTCOME_ALREADY_YOURS,
+    OUTCOME_CLAIMED,
+    OUTCOME_NOT_ASSIGNED,
+    OUTCOME_NOT_YOURS,
+    OUTCOME_RELEASED,
+    OUTCOME_TAKEN,
+    ClaimRepository,
+)
 from .models import (
     DEFAULT_PAGE_SIZE,
     QUICK_ACTIONS,
@@ -31,6 +53,18 @@ from .usability import (
 HIDDEN_RAW_PREFIXES = ("_",)
 
 
+def _safe_next(value: Optional[str], fallback: str) -> str:
+    """Only follow same-site relative redirects after sign-in or a claim."""
+    if not value:
+        return fallback
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc or not value.startswith("/"):
+        return fallback
+    if value.startswith("//") or "\\" in value:
+        return fallback
+    return value
+
+
 def create_app(
     storage: Optional[Storage] = None,
     sqlite_path: Optional[Path] = None,
@@ -42,6 +76,9 @@ def create_app(
         static_folder=str(here / "static"),
     )
     app.config["TEMPLATES_AUTO_RELOAD"] = True
+    app.config["SECRET_KEY"] = os.environ.get("INBOX_SECRET_KEY") or secrets.token_hex(32)
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
     owns_storage = storage is None
     usability_mode = usability_mode_enabled()
     participant_id = None
@@ -71,6 +108,11 @@ def create_app(
         participant_id=participant_id,
         session_id=session_id,
     )
+    accounts = AccountRepository(storage.conn)
+    claims = ClaimRepository(storage.conn)
+    claims_enabled = not usability_mode
+    app.config["INBOX_ACCOUNTS"] = accounts
+    app.config["INBOX_CLAIMS"] = claims
     app.config["INBOX_STORAGE"] = storage
     app.config["INBOX_REPO"] = repo
     app.config["INBOX_OWNS_STORAGE"] = owns_storage
@@ -82,9 +124,22 @@ def create_app(
     def _close(_exc: Optional[BaseException]) -> None:
         return None
 
+    @app.before_request
+    def _load_current_user() -> None:
+        g.current_user = None
+        user_id = session.get("user_id")
+        if user_id is not None:
+            user = accounts.get_user(user_id)
+            if user is not None and user.is_active:
+                g.current_user = user
+            else:
+                session.pop("user_id", None)
+
     @app.context_processor
     def _usability_context() -> dict:
         return {
+            "current_user": g.get("current_user"),
+            "claims_enabled": claims_enabled,
             "usability_mode": usability_mode,
             "participant_id": participant_id,
         }
@@ -272,6 +327,110 @@ def create_app(
             previous_status=card.review_status,
         )
         return redirect(card.source_url)
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        next_url = _safe_next(
+            request.values.get("next"), url_for("inbox")
+        )
+        if g.current_user is not None and request.method == "GET":
+            return redirect(next_url)
+        error = None
+        username = ""
+        if request.method == "POST":
+            username = (request.form.get("username") or "").strip()
+            user = accounts.authenticate(
+                username, request.form.get("password") or ""
+            )
+            if user is not None:
+                session.clear()
+                session["user_id"] = user.id
+                return redirect(next_url)
+            error = "Username or password is not correct."
+        return (
+            render_template(
+                "login.html", error=error, username=username, next_url=next_url
+            ),
+            401 if error else 200,
+        )
+
+    @app.route("/logout", methods=["POST"])
+    def logout():
+        session.clear()
+        return redirect(url_for("inbox"))
+
+    def _claim_redirect(source_system: str, native_record_id: str):
+        fallback = url_for(
+            "card_detail",
+            source_system=source_system,
+            native_record_id=native_record_id,
+        )
+        return redirect(
+            _safe_next(request.form.get("next"), fallback), code=303
+        )
+
+    @app.route(
+        "/cards/<source_system>/<native_record_id>/claim",
+        methods=["POST"],
+    )
+    def card_claim(source_system: str, native_record_id: str):
+        if not claims_enabled:
+            abort(404)
+        if g.current_user is None:
+            flash("Sign in with your own account to claim a task.", "error")
+            return redirect(
+                url_for("login", next=request.form.get("next") or ""),
+                code=303,
+            )
+        try:
+            result = claims.claim(
+                source_system, native_record_id, g.current_user.id
+            )
+        except KeyError:
+            abort(404)
+        owner = result.assignee.display_name if result.assignee else ""
+        if result.outcome == OUTCOME_CLAIMED:
+            flash("You claimed this task.", "success")
+        elif result.outcome == OUTCOME_ALREADY_YOURS:
+            flash("This task is already assigned to you.", "info")
+        elif result.outcome == OUTCOME_TAKEN:
+            flash(
+                "Could not claim this task: it was already claimed by {}. "
+                "The card now shows the current assignee.".format(owner),
+                "error",
+            )
+        return _claim_redirect(source_system, native_record_id)
+
+    @app.route(
+        "/cards/<source_system>/<native_record_id>/release",
+        methods=["POST"],
+    )
+    def card_release(source_system: str, native_record_id: str):
+        if not claims_enabled:
+            abort(404)
+        if g.current_user is None:
+            flash("Sign in to release a task.", "error")
+            return redirect(
+                url_for("login", next=request.form.get("next") or ""),
+                code=303,
+            )
+        if repo.get_card(source_system, native_record_id) is None:
+            abort(404)
+        result = claims.release(
+            source_system, native_record_id, g.current_user.id
+        )
+        if result.outcome == OUTCOME_RELEASED:
+            flash("You released this task.", "success")
+        elif result.outcome == OUTCOME_NOT_ASSIGNED:
+            flash("This task was already unassigned.", "info")
+        elif result.outcome == OUTCOME_NOT_YOURS:
+            flash(
+                "Only {} can release this task.".format(
+                    result.assignee.display_name
+                ),
+                "error",
+            )
+        return _claim_redirect(source_system, native_record_id)
 
     if usability_mode:
 

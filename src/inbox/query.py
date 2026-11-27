@@ -223,6 +223,9 @@ class InboxRepository:
             raw_fields=raw_fields,
             related_cards=related,
             attachments=attachments,
+            assignee_user_id=data.get("assignee_user_id"),
+            assignee_name=data.get("assignee_name"),
+            claimed_at=data.get("claimed_at"),
         )
 
     def search(self, query: InboxQuery) -> InboxPage:
@@ -239,6 +242,11 @@ class InboxRepository:
             LEFT JOIN card_reviews
                 ON card_reviews.source_system = cards.source_system
                AND card_reviews.native_record_id = cards.native_record_id
+            LEFT JOIN card_claims
+                ON card_claims.source_system = cards.source_system
+               AND card_claims.native_record_id = cards.native_record_id
+            LEFT JOIN users AS claim_users
+                ON claim_users.id = card_claims.user_id
             WHERE {where}
         """.format(where=where)
         total = int(
@@ -265,6 +273,9 @@ class InboxRepository:
                 COALESCE(card_reviews.status, ?) AS review_status,
                 card_reviews.note AS review_note,
                 card_reviews.reviewed_at,
+                card_claims.user_id AS assignee_user_id,
+                claim_users.display_name AS assignee_name,
+                card_claims.claimed_at AS claimed_at,
                 {display_date} AS display_date,
                 {keywords} AS matched_keywords,
                 {related} AS related_cards_count,
@@ -311,6 +322,9 @@ class InboxRepository:
                 COALESCE(card_reviews.status, ?) AS review_status,
                 card_reviews.note AS review_note,
                 card_reviews.reviewed_at,
+                card_claims.user_id AS assignee_user_id,
+                claim_users.display_name AS assignee_name,
+                card_claims.claimed_at AS claimed_at,
                 {display_date} AS display_date,
                 {keywords} AS matched_keywords,
                 {related} AS related_cards_count,
@@ -319,6 +333,11 @@ class InboxRepository:
             LEFT JOIN card_reviews
                 ON card_reviews.source_system = cards.source_system
                AND card_reviews.native_record_id = cards.native_record_id
+            LEFT JOIN card_claims
+                ON card_claims.source_system = cards.source_system
+               AND card_claims.native_record_id = cards.native_record_id
+            LEFT JOIN users AS claim_users
+                ON claim_users.id = card_claims.user_id
             WHERE cards.source_system = ? AND cards.native_record_id = ?
             """.format(
                 display_date=DISPLAY_DATE_SQL,

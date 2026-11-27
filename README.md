@@ -181,6 +181,27 @@ Open [http://127.0.0.1:5050/](http://127.0.0.1:5050/). The Inbox reads
 `data/normalized/sios.sqlite` only. Default view is unreviewed (`NEW`) cards.
 Review status and notes are stored in `card_reviews`, not in collector fields.
 
+### Accounts and claiming tasks
+
+Team members get individual accounts, created by whoever runs the Inbox:
+
+```bash
+python -m src.inbox.users create ola --display-name "Ola Nowak"
+python -m src.inbox.users list
+python -m src.inbox.users set-password ola
+python -m src.inbox.users deactivate ola   # also releases their claimed cards
+```
+
+Passwords are prompted for (or read from stdin with `--password-stdin`) and
+stored as salted hashes. Sign in at `/login`. Set `INBOX_SECRET_KEY` so sessions
+survive restarts; otherwise a random key is generated at startup.
+
+Signed-in users can **Claim task** on an unassigned card. Everyone sees
+**Assigned to [display name]** on the card in the list and in its detail view;
+only the assignee gets **Release task**. A card has at most one assignee, and
+simultaneous claims are resolved by the database: the loser sees an error and
+the current assignee. Claims are separate from the review status and filters.
+
 ### Usability test (isolated)
 
 Do not use the volunteer database for volunteer interviews. Prepare the

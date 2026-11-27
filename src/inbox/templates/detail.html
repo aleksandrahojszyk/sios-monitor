@@ -1,3 +1,4 @@
+{% from '_claims.html' import flashes, account_bar, assignee, claim_controls with context %}
 {% if not fragment %}
 <!DOCTYPE html>
 <html lang="en">
@@ -17,6 +18,8 @@
   </div>
   {% endif %}
   <p><a href="{{ url_for('inbox') }}?{{ filter_qs(query) }}">Back to inbox</a></p>
+  {% if claims_enabled %}{{ account_bar() }}{% endif %}
+  {{ flashes() }}
 {% endif %}
 
 <article class="detail">
@@ -25,6 +28,18 @@
     <h2 id="drawer-title">{{ card.document_name or card.card_number or 'Untitled card' }}</h2>
     <p class="status status--{{ card.review_status }}">{{ card.review_label }}</p>
   </header>
+
+  {% if claims_enabled %}
+  <section class="ownership">
+    <h3>Task owner</h3>
+    {% if card.assignee_name %}
+    <p class="ownership__line">{{ assignee(card) }}</p>
+    {% else %}
+    <p class="muted">Unassigned. Claiming is separate from the review status.</p>
+    {% endif %}
+    {{ claim_controls(card, (url_for('inbox') ~ '?' ~ filter_qs(query)) if fragment else url_for('card_detail', source_system=card.source_system, native_record_id=card.native_record_id)) }}
+  </section>
+  {% endif %}
 
   <section>
     <h3>Source metadata</h3>
